@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 
-from agent.agent import Agent
+from agent.agent import Agent, MAX_HISTORY_MESSAGES
 
 st.set_page_config(page_title="AI Data Analyst", layout="wide")
 
@@ -9,13 +9,22 @@ st.title("AI Data Analyst")
 st.write("Upload a dataset and ask questions about it in plain English.")
 
 # --- Session state setup ---
-# session_state persists values across Streamlit reruns.
-# Without this, the DataFrame and the Agent would be recreated every rerun.
 if "df" not in st.session_state:
     st.session_state.df = None
 
 if "agent" not in st.session_state:
     st.session_state.agent = None
+
+# Conversation memory: plain {"role": "user"/"assistant", "content": str}
+# dicts only. Never store tool_calls or role="tool" entries here -- see
+# the warning in agent/agent.py for why.
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# The most recent figure, shown below the chat. Only the latest chart is
+# kept (not one per historical turn) to keep session state light.
+if "last_figure" not in st.session_state:
+    st.session_state.last_figure = None
 
 
 def load_dataset(uploaded_file) -> pd.DataFrame:
@@ -31,8 +40,7 @@ def load_dataset(uploaded_file) -> pd.DataFrame:
 
 
 def get_agent() -> Agent:
-    """Create the Agent once and reuse it across reruns.
-    Creating a new Groq client on every rerun is wasteful and unnecessary."""
+    """Create the Agent once and reuse it across reruns."""
     if st.session_state.agent is None:
         st.session_state.agent = Agent()
     return st.session_state.agent
@@ -74,11 +82,24 @@ if df is not None:
     st.subheader("Preview (first 5 rows)")
     st.dataframe(df.head(), use_container_width=True)
 
-    # --- Question section ---
+    # --- Conversation section ---
     st.header("Ask a question about your data")
+
+    col_clear, _ = st.columns([1, 5])
+    with col_clear:
+        if st.button("Clear conversation"):
+            st.session_state.messages = []
+            st.session_state.last_figure = None
+            st.rerun()
+
+    # Render prior turns as a chat history.
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.write(msg["content"])
+
     question = st.text_area(
         "Ask your question:",
-        placeholder="e.g. What is the average salary by department?",
+        placeholder="e.g. What is the average salary by department? Then try a follow-up like 'what about by store?'",
     )
 
     if st.button("Analyze", type="primary"):
@@ -88,16 +109,31 @@ if df is not None:
             try:
                 with st.spinner("Thinking..."):
                     agent = get_agent()
-                    result = agent.run(question, df)
+                    result = agent.run(
+                        question,
+                        df,
+                        conversation_history=st.session_state.messages,
+                    )
 
-                st.subheader("AI Answer")
-                st.write(result["answer"])
+                # Persist this turn AFTER the call, so the history sent
+                # to the Agent never includes the current question twice.
+                st.session_state.messages.append({"role": "user", "content": question})
+                st.session_state.messages.append({"role": "assistant", "content": result["answer"]})
 
-                if result["figure"] is not None:
-                    st.subheader("Visualization")
-                    st.plotly_chart(result["figure"], use_container_width=True)
+                # Trim history so it can't grow unbounded across a long session.
+                if len(st.session_state.messages) > MAX_HISTORY_MESSAGES:
+                    st.session_state.messages = st.session_state.messages[-MAX_HISTORY_MESSAGES:]
+
+                st.session_state.last_figure = result["figure"]
+
+                st.rerun()
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
+
+    if st.session_state.last_figure is not None:
+        st.subheader("Visualization")
+        st.plotly_chart(st.session_state.last_figure, use_container_width=True)
+
 else:
     st.info("Upload a CSV or Excel file to get started.")
