@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 
+from tools.date_utils import convert_date_columns
 from agent.agent import Agent, MAX_HISTORY_MESSAGES
 
 st.set_page_config(page_title="AI Data Analyst", layout="wide")
@@ -28,16 +29,26 @@ if "last_figure" not in st.session_state:
 
 
 def load_dataset(uploaded_file) -> pd.DataFrame:
-    """Load an uploaded CSV or Excel file into a pandas DataFrame."""
+    """Load and automatically detect date columns."""
+
     filename = uploaded_file.name.lower()
 
     if filename.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    elif filename.endswith((".xlsx", ".xls")):
-        return pd.read_excel(uploaded_file)
-    else:
-        raise ValueError("Unsupported file type. Please upload a .csv or .xlsx file.")
+        df = pd.read_csv(uploaded_file)
 
+    elif filename.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(uploaded_file)
+
+    else:
+        raise ValueError(
+            "Unsupported file type. "
+            "Please upload a .csv or .xlsx file."
+        )
+
+    # Automatically detect and convert date columns.
+    df, detected_dates = convert_date_columns(df)
+
+    return df
 
 def get_agent() -> Agent:
     """Create the Agent once and reuse it across reruns."""
