@@ -35,20 +35,12 @@ from tools.visualization import (
 # CONVERSATION MEMORY
 # ============================================================
 
-# Maximum number of messages kept in conversation history.
-#
-# 20 messages = approximately 10 user/assistant turns.
-#
-# We keep this limited so the conversation does not grow
-# indefinitely and consume too many LLM tokens.
 MAX_HISTORY_MESSAGES = 20
 
 
 # ============================================================
 # TOOL FUNCTIONS
 # ============================================================
-
-# The LLM can only request tools that exist in this dictionary.
 
 TOOL_FUNCTIONS = {
     "dataset_info": dataset_info,
@@ -62,8 +54,6 @@ TOOL_FUNCTIONS = {
 # ============================================================
 # TOOL SCHEMAS
 # ============================================================
-
-# These schemas are sent to the LLM during the first call.
 
 TOOL_SCHEMAS = [
     DATASET_INFO_SCHEMA,
@@ -79,55 +69,98 @@ TOOL_SCHEMAS = [
 # ============================================================
 
 SYSTEM_PROMPT = (
-    "You are a data analyst assistant working with a pandas DataFrame. "
+    "You are a professional data analyst assistant working "
+    "with a pandas DataFrame. "
 
-    "IMPORTANT: The actual dataset is available to the Python tools. "
-    "You must NEVER claim that the actual data values are unavailable. "
+    "IMPORTANT: The actual dataset is available to the "
+    "Python tools. You must NEVER claim that the actual "
+    "data values are unavailable. "
 
     "Choose the correct tool based on the user's question. "
 
-    "Use dataset_info ONLY when the user asks about the dataset "
-    "structure, such as the number of rows, number of columns, "
-    "column names, or data types. "
+    "Use dataset_info ONLY when the user asks about the "
+    "dataset structure, such as number of rows, number of "
+    "columns, column names, or data types. "
 
-    "Use missing_values when the user asks about missing or null values. "
+    "Use missing_values when the user asks about missing "
+    "or null values. "
 
-    "Use statistics when the user asks for descriptive statistics "
-    "of numeric columns, such as mean, median, standard deviation, "
-    "minimum, maximum, quartiles, range, or distribution statistics. "
+    "Use statistics when the user asks for descriptive "
+    "statistics of numeric columns, such as mean, median, "
+    "standard deviation, minimum, maximum, quartiles, "
+    "range, or distribution statistics. "
 
-    "Use groupby_analysis when the user asks for a calculation "
-    "grouped by another column, such as 'average salary by department', "
-    "'total sales by store', 'average sales per store', "
-    "or 'number of orders by customer'. "
+    "Use groupby_analysis when the user asks for a "
+    "calculation BY, PER, FOR EACH, or ACROSS categories "
+    "or groups. "
 
-    "For groupby_analysis, identify: "
-    "group_column = the column used to define the groups, "
+    "For groupby_analysis identify: "
+    "group_column = the column defining the groups, "
     "value_column = the numeric column being calculated, "
-    "agg_function = the requested aggregation such as mean, sum, "
-    "count, min, max, median, or std. "
+    "agg_function = mean, sum, count, min, max, median, "
+    "or std. "
 
-    "Use create_visualization when the user asks for a chart, "
-    "graph, plot, or visualization. "
+    "IMPORTANT DATE RULES: "
+    "The Python application automatically detects common "
+    "date columns and converts them to pandas datetime. "
 
-    "Always use a tool when the question requires information "
-    "from the dataset. "
+    "A column whose data type is datetime64 should be "
+    "treated as a DATE/TIME column, not as a normal string. "
+
+    "When the user asks about dates, time, months, years, "
+    "daily sales, weekly sales, monthly sales, sales over "
+    "time, trends over time, or chronological order, "
+    "identify the appropriate datetime column. "
+
+    "When the user asks for a chart over time, prefer "
+    "a line chart and use the date column as x_column. "
+
+    "When the user asks for a chart BY DATE or BY MONTH "
+    "and the data contains a datetime column, use that "
+    "datetime column rather than treating it as text. "
+
+    "If a datetime column is present, do not describe it "
+    "as merely a string column. "
+
+    "Use create_visualization when the user asks for a "
+    "chart, graph, plot, or visualization. "
+
+    "For a time trend, normally use chart_type='line'. "
+
+    "For category comparisons, normally use chart_type='bar'. "
+
+    "For a distribution of one numeric variable, use "
+    "chart_type='histogram'. "
+
+    "For comparing distributions across categories, use "
+    "chart_type='box'. "
+
+    "Always use a tool when the question requires "
+    "information from the dataset. "
 
     "Never guess or invent numbers. "
 
     "The Python tools perform all calculations. "
-    "Your job is only to select the appropriate tool and later "
-    "explain the tool result clearly. "
 
-    "The conversation may contain previous questions and answers. "
-    "Use this previous context to understand follow-up questions. "
+    "Your job is to select the appropriate tool and "
+    "later explain the tool result clearly. "
+
+    "The conversation may contain previous questions "
+    "and answers. Use previous context to understand "
+    "follow-up questions. "
 
     "For example, if the user first asks about Weekly_Sales "
-    "and then asks 'what about by store?', understand that "
+    "and then asks 'show it by store', understand that "
     "the second question refers to Weekly_Sales and Store. "
 
+    "If the user asks 'show me a chart of that', use the "
+    "most recent relevant context to identify the columns "
+    "and operation. "
+
     "Do not treat previous answers as tool results. "
-    "If a new question requires data, use the appropriate tool."
+
+    "If a new question requires data, use the appropriate "
+    "tool again."
 )
 
 
@@ -138,38 +171,11 @@ SYSTEM_PROMPT = (
 class Agent:
     """
     Orchestrates the LLM <-> tool-calling process.
-
-    The Agent receives:
-
-        question
-        dataframe
-        optional conversation history
-
-    The conversation history contains ONLY normal text messages:
-
-        {
-            "role": "user",
-            "content": "..."
-        }
-
-        {
-            "role": "assistant",
-            "content": "..."
-        }
-
-    IMPORTANT:
-    Conversation history must NEVER contain:
-
-        - tool_calls
-        - role="tool"
-        - tool_call_id
-
-    This keeps the conversation memory simple and avoids
-    problems with Groq tool-calling across different turns.
     """
 
     def __init__(self) -> None:
         self.llm = LLMClient()
+
 
     # ========================================================
     # MAIN RUN METHOD
@@ -179,55 +185,22 @@ class Agent:
         self,
         question: str,
         df: pd.DataFrame,
-        conversation_history: list[dict[str, str]] | None = None,
+        conversation_history: (
+            list[dict[str, str]] | None
+        ) = None,
     ) -> dict[str, Any]:
-        """
-        Run one user question through the agent.
-
-        Parameters
-        ----------
-        question:
-            The current user's question.
-
-        df:
-            The currently loaded pandas DataFrame.
-
-        conversation_history:
-            Previous user/assistant messages.
-
-        Returns
-        -------
-        dict
-            {
-                "answer": str,
-                "figure": Plotly Figure or None
-            }
-        """
-
-        # ----------------------------------------------------
-        # STEP 1
-        # Prepare conversation history
-        # ----------------------------------------------------
 
         history = conversation_history or []
 
-        # Defensive limit.
-        # app.py also limits this, but we protect the Agent too.
         if len(history) > MAX_HISTORY_MESSAGES:
-            history = history[-MAX_HISTORY_MESSAGES:]
+
+            history = history[
+                -MAX_HISTORY_MESSAGES:
+            ]
+
 
         # ----------------------------------------------------
-        # Build messages for the first LLM call.
-        #
-        # Important:
-        #
-        # system prompt
-        #       +
-        # previous text conversation
-        #       +
-        # current question
-        #
-        # No previous tool calls are included.
+        # First LLM call
         # ----------------------------------------------------
 
         messages = [
@@ -246,45 +219,47 @@ class Agent:
             }
         )
 
-        figure = None
-
-        # ----------------------------------------------------
-        # STEP 2
-        # Ask the LLM which tool to use.
-        # ----------------------------------------------------
 
         response_message = self.llm.chat(
             messages,
             tools=TOOL_SCHEMAS,
         )
 
+
         # ----------------------------------------------------
-        # If the LLM doesn't request a tool,
-        # return its answer directly.
+        # No tool requested
         # ----------------------------------------------------
 
-        if not getattr(response_message, "tool_calls", None):
+        if not getattr(
+            response_message,
+            "tool_calls",
+            None,
+        ):
+
             return {
                 "answer": response_message.content,
                 "figure": None,
             }
 
+
         # ----------------------------------------------------
-        # STEP 3
-        # Execute requested tools.
+        # Execute tools
         # ----------------------------------------------------
 
         tool_results = []
 
+        figure = None
+
+
         for tool_call in response_message.tool_calls:
 
-            tool_name = tool_call.function.name
+            tool_name = (
+                tool_call.function.name
+            )
 
-            # -----------------------------------------------
-            # Parse tool arguments
-            # -----------------------------------------------
 
             try:
+
                 tool_args = json.loads(
                     tool_call.function.arguments
                 )
@@ -293,9 +268,6 @@ class Agent:
 
                 tool_args = {}
 
-            # -----------------------------------------------
-            # Execute registered tool
-            # -----------------------------------------------
 
             tool_result = self._execute_tool(
                 tool_name,
@@ -303,9 +275,8 @@ class Agent:
                 df,
             )
 
-            # -----------------------------------------------
+
             # Extract Plotly figure
-            # -----------------------------------------------
 
             if (
                 isinstance(tool_result, dict)
@@ -316,13 +287,11 @@ class Agent:
 
                 tool_result = {
                     key: value
-                    for key, value in tool_result.items()
+                    for key, value
+                    in tool_result.items()
                     if key != "figure"
                 }
 
-            # -----------------------------------------------
-            # Store tool result
-            # -----------------------------------------------
 
             tool_results.append(
                 {
@@ -331,9 +300,9 @@ class Agent:
                 }
             )
 
+
         # ----------------------------------------------------
-        # STEP 4
-        # Convert tool results to text for final LLM call.
+        # Prepare result text
         # ----------------------------------------------------
 
         tool_results_text = "\n\n".join(
@@ -345,29 +314,17 @@ class Agent:
             for item in tool_results
         )
 
+
         # ----------------------------------------------------
-        # STEP 5
-        # Final LLM call.
-        #
-        # IMPORTANT:
-        #
-        # We deliberately create a completely new conversation.
-        #
-        # We DO NOT include:
-        #
-        # - previous conversation history
-        # - tool_calls
-        # - role="tool"
-        # - tool schemas
-        #
-        # The LLM only explains the Python result.
+        # Final explanation call
         # ----------------------------------------------------
 
         final_messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are a data analyst assistant. "
+                    "You are a professional data analyst "
+                    "assistant. "
 
                     "The Python tools have already performed "
                     "the required calculations. "
@@ -375,14 +332,18 @@ class Agent:
                     "Your job now is ONLY to explain the "
                     "provided tool result to the user. "
 
-                    "Do NOT call any tools. "
+                    "Do NOT call tools. "
 
                     "Do NOT perform another calculation. "
 
-                    "Do NOT invent any numbers. "
+                    "Do NOT invent numbers. "
 
                     "Use the exact values contained in the "
                     "tool result. "
+
+                    "If the result contains an error, explain "
+                    "the error clearly instead of inventing "
+                    "an answer. "
 
                     "Answer clearly and concisely."
                 ),
@@ -401,25 +362,18 @@ class Agent:
             },
         ]
 
-        # ----------------------------------------------------
-        # STEP 6
-        # Ask LLM to explain the tool result.
-        # ----------------------------------------------------
 
         final_message = self.llm.chat(
             final_messages,
             tool_choice="none",
         )
 
-        # ----------------------------------------------------
-        # STEP 7
-        # Return final answer and optional visualization.
-        # ----------------------------------------------------
 
         return {
             "answer": final_message.content,
             "figure": figure,
         }
+
 
     # ========================================================
     # TOOL EXECUTOR
@@ -431,22 +385,11 @@ class Agent:
         tool_args: dict[str, Any],
         df: pd.DataFrame,
     ) -> Any:
-        """
-        Execute only tools explicitly registered in
-        TOOL_FUNCTIONS.
 
-        The LLM cannot execute arbitrary Python code.
-        """
+        tool_function = TOOL_FUNCTIONS.get(
+            tool_name
+        )
 
-        # ----------------------------------------------------
-        # Find requested tool
-        # ----------------------------------------------------
-
-        tool_function = TOOL_FUNCTIONS.get(tool_name)
-
-        # ----------------------------------------------------
-        # Unknown tool
-        # ----------------------------------------------------
 
         if tool_function is None:
 
@@ -457,9 +400,6 @@ class Agent:
                 )
             }
 
-        # ----------------------------------------------------
-        # Execute tool safely
-        # ----------------------------------------------------
 
         try:
 
@@ -472,6 +412,7 @@ class Agent:
 
             return {
                 "error": (
-                    f"Tool '{tool_name}' failed: {e}"
+                    f"Tool '{tool_name}' failed: "
+                    f"{e}"
                 )
             }
