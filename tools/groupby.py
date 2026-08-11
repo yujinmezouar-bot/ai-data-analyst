@@ -3,8 +3,10 @@ from typing import Any
 import pandas as pd
 
 
-# Aggregation functions allowed for the LLM.
-# Explicit whitelist for safety.
+# ============================================================
+# ALLOWED AGGREGATIONS
+# ============================================================
+
 ALLOWED_AGG_FUNCTIONS = {
     "mean",
     "sum",
@@ -16,81 +18,74 @@ ALLOWED_AGG_FUNCTIONS = {
 }
 
 
-# Date granularities supported by this tool.
-ALLOWED_DATE_GRANULARITIES = {
-    "day",
-    "week",
-    "month",
-    "quarter",
-    "year",
-}
-
+# ============================================================
+# GROUPBY ANALYSIS
+# ============================================================
 
 def groupby_analysis(
     df: pd.DataFrame,
     group_column: str,
     value_column: str,
     agg_function: str = "mean",
-    date_granularity: str | None = None,
 ) -> dict[str, Any]:
     """
-    Group the dataset by a column and aggregate a value column.
+    Group the dataset by group_column and aggregate
+    value_column.
 
-    Supports normal categorical grouping:
-
-        department → salary → mean
-
-    and date grouping:
-
-        Date → Weekly_Sales → sum → month
-
-    Example:
-
-        groupby_analysis(
-            df,
-            group_column="Date",
-            value_column="Weekly_Sales",
-            agg_function="sum",
-            date_granularity="month",
-        )
+    Supports normal categorical columns as well as
+    pandas datetime columns.
     """
 
     if df is None:
+
         return {
             "error": "No dataset is loaded."
         }
 
-    # ---------------------------------------------------------
-    # Validate group column
-    # ---------------------------------------------------------
+
+    # --------------------------------------------------------
+    # Check group column
+    # --------------------------------------------------------
 
     if group_column not in df.columns:
+
         return {
             "error": (
                 f"Column '{group_column}' "
                 "not found in the dataset."
             ),
-            "available_columns": list(df.columns),
+            "available_columns": list(
+                df.columns
+            ),
         }
 
-    # ---------------------------------------------------------
-    # Validate value column
-    # ---------------------------------------------------------
+
+    # --------------------------------------------------------
+    # Check value column
+    # --------------------------------------------------------
 
     if value_column not in df.columns:
+
         return {
             "error": (
                 f"Column '{value_column}' "
                 "not found in the dataset."
             ),
-            "available_columns": list(df.columns),
+            "available_columns": list(
+                df.columns
+            ),
         }
 
-    # ---------------------------------------------------------
-    # Validate aggregation
-    # ---------------------------------------------------------
 
-    if agg_function not in ALLOWED_AGG_FUNCTIONS:
+    # --------------------------------------------------------
+    # Check aggregation
+    # --------------------------------------------------------
+
+    if (
+        agg_function
+        not in ALLOWED_AGG_FUNCTIONS
+    ):
+
         return {
             "error": (
                 f"Aggregation function "
@@ -101,40 +96,10 @@ def groupby_analysis(
             ),
         }
 
-    # ---------------------------------------------------------
-    # Validate date granularity
-    # ---------------------------------------------------------
 
-    if date_granularity is not None:
-
-        if date_granularity not in ALLOWED_DATE_GRANULARITIES:
-            return {
-                "error": (
-                    f"Date granularity "
-                    f"'{date_granularity}' is not supported."
-                ),
-                "allowed_date_granularities": sorted(
-                    ALLOWED_DATE_GRANULARITIES
-                ),
-            }
-
-        # Date granularity only makes sense with a datetime
-        # group column.
-        if not pd.api.types.is_datetime64_any_dtype(
-            df[group_column]
-        ):
-            return {
-                "error": (
-                    f"Column '{group_column}' is not recognized "
-                    "as a datetime column. "
-                    "Make sure the date column was detected "
-                    "correctly when the dataset was loaded."
-                )
-            }
-
-    # ---------------------------------------------------------
-    # Validate value column
-    # ---------------------------------------------------------
+    # --------------------------------------------------------
+    # Check numeric value column
+    # --------------------------------------------------------
 
     if (
         agg_function != "count"
@@ -142,145 +107,64 @@ def groupby_analysis(
             df[value_column]
         )
     ):
+
         return {
             "error": (
-                f"Column '{value_column}' is not numeric, "
-                f"so '{agg_function}' cannot be computed "
-                "on it. Try 'count' instead, or choose "
+                f"Column '{value_column}' "
+                f"is not numeric, so "
+                f"'{agg_function}' cannot be "
+                "computed on it. "
+                "Try 'count' instead, or pick "
                 "a numeric column."
             )
         }
+
 
     try:
 
         working_df = df.copy()
 
-        # -----------------------------------------------------
-        # Normal groupby
-        # -----------------------------------------------------
 
-        if date_granularity is None:
+        # ----------------------------------------------------
+        # Datetime grouping
+        # ----------------------------------------------------
+
+        is_datetime = (
+            pd.api.types.is_datetime64_any_dtype(
+                working_df[group_column]
+            )
+        )
+
+
+        if is_datetime:
+
+            # Remove missing dates
+
+            working_df = working_df.dropna(
+                subset=[group_column]
+            )
+
 
             grouped = (
                 working_df
-                .groupby(
-                    group_column,
-                    dropna=False,
-                )[value_column]
+                .groupby(group_column)[
+                    value_column
+                ]
                 .agg(agg_function)
+                .sort_index()
             )
 
-            result = {}
-
-            for key, value in grouped.items():
-
-                if pd.isna(value):
-                    result[str(key)] = None
-                else:
-                    result[str(key)] = round(
-                        float(value),
-                        2,
-                    )
-
-        # -----------------------------------------------------
-        # Date groupby
-        # -----------------------------------------------------
 
         else:
 
-            date_series = working_df[group_column]
-
-            if date_granularity == "day":
-
-                working_df["_date_group"] = (
-                    date_series.dt.floor("D")
-                )
-
-            elif date_granularity == "week":
-
-                # Start of the week = Monday.
-                working_df["_date_group"] = (
-                    date_series
-                    - pd.to_timedelta(
-                        date_series.dt.weekday,
-                        unit="D",
-                    )
-                ).dt.floor("D")
-
-            elif date_granularity == "month":
-
-                working_df["_date_group"] = (
-                    date_series.dt.to_period("M")
-                    .dt.to_timestamp()
-                )
-
-            elif date_granularity == "quarter":
-
-                working_df["_date_group"] = (
-                    date_series.dt.to_period("Q")
-                    .dt.to_timestamp()
-                )
-
-            elif date_granularity == "year":
-
-                working_df["_date_group"] = (
-                    date_series.dt.to_period("Y")
-                    .dt.to_timestamp()
-                )
-
             grouped = (
                 working_df
-                .groupby(
-                    "_date_group",
-                    dropna=False,
-                )[value_column]
+                .groupby(group_column)[
+                    value_column
+                ]
                 .agg(agg_function)
             )
 
-            result = {}
-
-            for key, value in grouped.items():
-
-                if pd.isna(key):
-
-                    key_string = "Unknown"
-
-                else:
-
-                    if date_granularity == "day":
-                        key_string = key.strftime(
-                            "%Y-%m-%d"
-                        )
-
-                    elif date_granularity == "week":
-                        key_string = (
-                            "Week of "
-                            + key.strftime("%Y-%m-%d")
-                        )
-
-                    elif date_granularity == "month":
-                        key_string = key.strftime(
-                            "%Y-%m"
-                        )
-
-                    elif date_granularity == "quarter":
-                        key_string = (
-                            f"{key.year}-Q"
-                            f"{((key.month - 1) // 3) + 1}"
-                        )
-
-                    elif date_granularity == "year":
-                        key_string = key.strftime(
-                            "%Y"
-                        )
-
-                if pd.isna(value):
-                    result[key_string] = None
-                else:
-                    result[key_string] = round(
-                        float(value),
-                        2,
-                    )
 
     except Exception as e:
 
@@ -290,95 +174,132 @@ def groupby_analysis(
             )
         }
 
+
+    # --------------------------------------------------------
+    # Convert result to JSON-safe values
+    # --------------------------------------------------------
+
+    result = {}
+
+    for key, value in grouped.items():
+
+        if pd.isna(value):
+
+            result[str(key)] = None
+
+        else:
+
+            try:
+
+                result[str(key)] = round(
+                    float(value),
+                    2,
+                )
+
+            except (TypeError, ValueError):
+
+                result[str(key)] = str(value)
+
+
     return {
         "group_column": group_column,
         "value_column": value_column,
         "agg_function": agg_function,
-        "date_granularity": date_granularity,
+        "group_column_type": (
+            "datetime"
+            if is_datetime
+            else str(
+                df[group_column].dtype
+            )
+        ),
         "result": result,
     }
 
 
+# ============================================================
+# TOOL SCHEMA
+# ============================================================
+
 GROUPBY_ANALYSIS_SCHEMA = {
     "type": "function",
+
     "function": {
+
         "name": "groupby_analysis",
+
         "description": (
-            "Calculate an aggregation BY, PER, FOR EACH, "
-            "or ACROSS categories or time periods. "
-            ""
-            "Use this for questions such as: "
+            "Use this tool whenever the user asks "
+            "for a calculation BY, PER, FOR EACH, "
+            "or ACROSS categories, groups, dates, "
+            "months, or time periods. "
+
+            "Examples include: "
             "'average salary by department', "
+            "'average weekly sales by store', "
             "'total sales per region', "
             "'median salary by department', "
-            "'average weekly sales by store', "
-            "'sales by month', "
-            "'total sales per year', "
-            "'average sales by week', "
-            "or 'sales for each quarter'. "
-            ""
-            "group_column is the column defining the groups. "
-            "value_column is the numeric column to aggregate. "
-            "agg_function specifies the calculation: "
-            "mean, sum, count, min, max, median, or std. "
-            ""
-            "IMPORTANT FOR DATE COLUMNS: "
-            "If group_column is a date/datetime column and "
-            "the user asks for daily, weekly, monthly, "
-            "quarterly, or yearly analysis, provide "
-            "date_granularity as 'day', 'week', 'month', "
-            "'quarter', or 'year'. "
-            ""
-            "For example, for 'total sales by month', use "
-            "group_column='Date', "
-            "value_column='Sales', "
-            "agg_function='sum', "
-            "date_granularity='month'."
+            "'minimum sales for each store', "
+            "'maximum sales per region', "
+            "'average sales by date', "
+            "'total sales by month', "
+            "or 'number of orders per customer'. "
+
+            "group_column is the column defining "
+            "the groups. It can be categorical "
+            "or datetime. "
+
+            "value_column is the column to aggregate. "
+
+            "agg_function specifies the calculation "
+            "such as mean, sum, count, min, max, "
+            "median, or std."
         ),
+
         "parameters": {
+
             "type": "object",
+
             "properties": {
 
                 "group_column": {
+
                     "type": "string",
+
                     "description": (
                         "The column defining the groups. "
-                        "For time analysis this should be "
-                        "the detected datetime column."
+                        "This may be a categorical column "
+                        "such as 'department' or 'region', "
+                        "or a datetime column such as "
+                        "'Date'."
                     ),
                 },
 
                 "value_column": {
+
                     "type": "string",
+
                     "description": (
-                        "The numeric column to aggregate."
+                        "The numeric column to aggregate, "
+                        "such as 'salary', 'sales', "
+                        "or 'amount'."
                     ),
                 },
 
                 "agg_function": {
+
                     "type": "string",
+
                     "enum": sorted(
                         ALLOWED_AGG_FUNCTIONS
                     ),
-                    "description": (
-                        "Aggregation to apply: "
-                        "mean, sum, count, min, max, "
-                        "median, or std."
-                    ),
-                },
 
-                "date_granularity": {
-                    "type": "string",
-                    "enum": sorted(
-                        ALLOWED_DATE_GRANULARITIES
-                    ),
                     "description": (
-                        "Only use this when group_column "
-                        "is a date column. "
-                        "Choose day, week, month, quarter, "
-                        "or year. "
-                        "Leave it out for normal categorical "
-                        "grouping."
+                        "The aggregation function to apply. "
+                        "Use mean for average, sum for total, "
+                        "count for number of records, min "
+                        "for minimum, max for maximum, "
+                        "median for median, and std for "
+                        "standard deviation."
                     ),
                 },
             },
