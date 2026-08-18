@@ -46,18 +46,27 @@ def statistics(
                 "error": f"Column '{column}' contains no valid numeric values."
             }
 
+        std_val = round(float(series.std()), 2) if len(series) > 1 else 0.0
+        mean_val = round(float(series.mean()), 2)
+        q25_val = round(float(series.quantile(0.25)), 2)
+        q75_val = round(float(series.quantile(0.75)), 2)
+        iqr_val = round(float(q75_val - q25_val), 2)
+        skew_val = round(float(series.skew()), 2) if len(series) >= 3 and std_val > 0 else 0.0
+        cv_val = round(float(std_val / abs(mean_val)), 4) if mean_val != 0 and std_val > 0 else None
+
         return {
             "column": column,
             "count": int(series.count()),
-            "mean": round(float(series.mean()), 2),
+            "mean": mean_val,
             "median": round(float(series.median()), 2),
-            "std": round(float(series.std()), 2)
-            if len(series) > 1
-            else 0.0,
+            "std": std_val,
             "min": round(float(series.min()), 2),
             "max": round(float(series.max()), 2),
-            "q25": round(float(series.quantile(0.25)), 2),
-            "q75": round(float(series.quantile(0.75)), 2),
+            "q25": q25_val,
+            "q75": q75_val,
+            "iqr": iqr_val,
+            "skewness": skew_val,
+            "coefficient_of_variation": cv_val,
         }
 
     # ---------------------------------------------------------
@@ -72,7 +81,7 @@ def statistics(
             "non_numeric_columns": list(df.columns),
         }
 
-    stats: dict[str, dict[str, float]] = {}
+    stats: dict[str, dict[str, Any]] = {}
 
     for col in numeric_df.columns:
 
@@ -81,16 +90,25 @@ def statistics(
         if series.empty:
             continue
 
+        std_val = round(float(series.std()), 2) if len(series) > 1 else 0.0
+        mean_val = round(float(series.mean()), 2)
+        q25_val = round(float(series.quantile(0.25)), 2)
+        q75_val = round(float(series.quantile(0.75)), 2)
+        iqr_val = round(float(q75_val - q25_val), 2)
+        skew_val = round(float(series.skew()), 2) if len(series) >= 3 and std_val > 0 else 0.0
+        cv_val = round(float(std_val / abs(mean_val)), 4) if mean_val != 0 and std_val > 0 else None
+
         stats[col] = {
-            "mean": round(float(series.mean()), 2),
+            "mean": mean_val,
             "median": round(float(series.median()), 2),
-            "std": round(float(series.std()), 2)
-            if len(series) > 1
-            else 0.0,
+            "std": std_val,
             "min": round(float(series.min()), 2),
             "max": round(float(series.max()), 2),
-            "q25": round(float(series.quantile(0.25)), 2),
-            "q75": round(float(series.quantile(0.75)), 2),
+            "q25": q25_val,
+            "q75": q75_val,
+            "iqr": iqr_val,
+            "skewness": skew_val,
+            "coefficient_of_variation": cv_val,
         }
 
     non_numeric_columns = [
