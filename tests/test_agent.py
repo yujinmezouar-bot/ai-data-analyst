@@ -515,4 +515,89 @@ def test_v54_why_and_visualization_guidance_is_explicit():
     assert "do not generate charts for simple scalar lookups" in SYSTEM_PROMPT
 
 
+def test_v55_question_to_tool_strategy_is_concise_and_complete():
+    """V5.5 supplies an explicit, compact intent-to-tool map to the decision model."""
+    assert "rankings and category comparisons use groupby_analysis" in SYSTEM_PROMPT
+    assert "descriptive distributions use statistics" in SYSTEM_PROMPT
+    assert "period-over-period comparisons use percentage_change" in SYSTEM_PROMPT
+    assert "relationships use correlation_analysis" in SYSTEM_PROMPT
+    assert "unusual values use outlier_analysis" in SYSTEM_PROMPT
+    assert "dataset_info only when the compact dataset context is insufficient" in SYSTEM_PROMPT
+
+
+def test_v55_entity_workflow_preserves_exact_filters_in_trace(sample_df: pd.DataFrame):
+    """A top-entity workflow uses exact names in its downstream time-analysis call."""
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.side_effect = [
+            _make_tool_msg("groupby_analysis", {
+                "group_column": "Store", "value_column": "Weekly_Sales", "top_n": 2,
+            }),
+            _make_tool_msg("time_analysis", {
+                "date_column": "Date", "value_column": "Weekly_Sales", "group_column": "Store",
+                "filter_values": ["C", "B"], "period": "month",
+            }),
+            _make_text_msg("Sufficient information collected."),
+            _make_text_msg("Stores C and B are shown over time."),
+        ]
+
+        result = Agent().run("Show the sales trend of the top 2 stores", sample_df)
+
+        calls = [step for step in result["trace"] if step["step"] == "tool_call"]
+        assert calls[0]["tool"] == "groupby_analysis"
+        assert calls[1]["tool"] == "time_analysis"
+        assert calls[1]["arguments"]["filter_values"] == ["C", "B"]
+        assert "Never invent filter values" in SYSTEM_PROMPT
+
+
+def test_v55_stops_after_sufficient_tool_result(sample_df: pd.DataFrame):
+    """Once the model signals sufficient results, no redundant analytical tool is run."""
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.side_effect = [
+            _make_tool_msg("groupby_analysis", {
+                "group_column": "Store", "value_column": "Weekly_Sales", "top_n": 1,
+            }),
+            _make_text_msg("The ranking is sufficient."),
+            _make_text_msg("Store C ranked first."),
+        ]
+
+        result = Agent().run("Which store performed best?", sample_df)
+
+        calls = [step for step in result["trace"] if step["step"] == "tool_call"]
+        assert len(calls) == 1
+        assert calls[0]["tool"] == "groupby_analysis"
+        assert mock_llm.chat.call_count == 3
+
+
+def test_v55_ambiguous_question_can_request_concise_clarification(sample_df: pd.DataFrame):
+    """An unresolved analytical request remains a direct, tool-free clarification."""
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.return_value = _make_text_msg("Which numeric column would you like to compare?")
+
+        result = Agent().run("Compare it", sample_df)
+
+        assert result["answer"] == "Which numeric column would you like to compare?"
+        assert result["trace"][-1]["tool_used"] is False
+        assert "ask one concise clarification" in SYSTEM_PROMPT
+
+
+def test_v55_follow_up_history_is_available_for_entity_resolution(sample_df: pd.DataFrame):
+    """Recent conversation context reaches the tool-decision prompt for follow-ups."""
+    history = [
+        {"role": "user", "content": "What are the top 2 stores?"},
+        {"role": "assistant", "content": "The top stores are C and B."},
+    ]
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.return_value = _make_text_msg("I can show C and B over time.")
+
+        Agent().run("Show their trend over time", sample_df, conversation_history=history)
+
+        decision_messages = mock_llm.chat.call_args.args[0]
+        assert history[1] in decision_messages
+        assert decision_messages[-1]["content"] == "Show their trend over time"
+
+
 

@@ -406,6 +406,10 @@ SYSTEM_PROMPT = (
     "with helpful text without calling any tools. "
 
     "TOOL SELECTION GUIDELINES: "
+    "- Match the question to the minimum sufficient analysis: rankings and category comparisons use groupby_analysis; "
+    "descriptive distributions use statistics; missing-data checks use missing_values; trends use time_analysis; "
+    "period-over-period comparisons use percentage_change; relationships use correlation_analysis; "
+    "unusual values use outlier_analysis; and dataset structure uses dataset_info only when the compact dataset context is insufficient. "
     "- Use dataset_info ONLY for questions about dataset structure (rows, columns, "
     "column names, data types, detected date columns, memory usage). "
 
@@ -445,6 +449,13 @@ SYSTEM_PROMPT = (
     "view ('average sales by store', 'sales by month', 'top 10 stores'), you MUST "
     "set agg_function (and period, for a datetime x_column) -- otherwise the chart "
     "plots raw rows instead of the aggregated values, which is wrong. "
+
+    "EFFICIENCY AND FOLLOW-UPS: "
+    "- Use the compact dataset context and recent conversation to resolve column names, entities, and references such as 'their', 'those stores', or 'the worst one'. "
+    "- If a prior tool result already contains the requested ranking, best/worst group, comparison, trend, or correlation, use it; do not call another tool merely to recompute it. "
+    "- For an entity/subset workflow, first obtain the entities with groupby_analysis when needed, then pass the exact returned names as filter_values to the next tool. Never invent filter values. "
+    "- Stop as soon as available results answer the question. Use create_visualization only when a chart materially improves a trend, distribution, multi-category comparison, or numeric relationship. "
+    "- If the dataset context and conversation cannot identify the relevant column, entity, or comparison unambiguously, ask one concise clarification rather than guessing. "
 
     "MULTI-STEP REASONING: "
     "For questions that require multiple steps (for example: identifying the top 3 "
