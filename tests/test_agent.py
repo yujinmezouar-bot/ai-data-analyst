@@ -9,11 +9,15 @@ import pytest
 from agent.agent import (
     FINAL_EXPLANATION_SYSTEM_PROMPT,
     MAX_HISTORY_MESSAGES,
+    MAX_LLM_REQUEST_CHARS,
     MAX_TOOL_ITERATIONS,
     SYSTEM_PROMPT,
+    TOOL_SCHEMAS,
     Agent,
     _build_execution_plan,
     _compact_tool_result,
+    _compact_messages_for_request,
+    _estimate_request_chars,
     _summarise_tool_results,
 )
 
@@ -673,6 +677,53 @@ def test_v56_insufficient_data_is_distinguished_from_no_result():
     assert "correlation_analysis: insufficient data for this analysis" in summary
     assert "statistics: limited data (2 observation(s))" in summary
     assert "do not draw a stronger conclusion" in summary
+
+
+def test_v57_large_history_is_compacted_before_the_decision_call(sample_df: pd.DataFrame):
+    """Regression for the production 8k-TPM request overflow."""
+    history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"old-{i}-" + "x" * 2500}
+        for i in range(MAX_HISTORY_MESSAGES)
+    ]
+    question = "What is the latest sales trend?"
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.return_value = _make_text_msg("I need the date column to analyze the trend.")
+
+        Agent().run(question, sample_df, conversation_history=history)
+
+    sent_messages = mock_llm.chat.call_args.args[0]
+    assert _estimate_request_chars(sent_messages, TOOL_SCHEMAS) <= MAX_LLM_REQUEST_CHARS
+    assert any(message["content"] == question for message in sent_messages)
+    assert any("old-19-" in message["content"] for message in sent_messages)
+    assert not any("old-0-" in message["content"] for message in sent_messages)
+
+
+def test_v57_short_messages_are_not_changed_by_budgeting():
+    messages = [
+        {"role": "system", "content": "System"},
+        {"role": "user", "content": "Current question"},
+    ]
+    assert _compact_messages_for_request(messages, TOOL_SCHEMAS, "Current question") == messages
+
+
+def test_v57_final_answer_prompt_is_bounded_after_large_tool_result(sample_df: pd.DataFrame):
+    """Large tool payloads are compacted before isolated final synthesis."""
+    large_result = {"result": {f"category-{i}": "x" * 300 for i in range(100)}}
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.side_effect = [
+            _make_tool_msg("statistics", {"column": "Weekly_Sales"}),
+            _make_text_msg("Sufficient."),
+            _make_text_msg("Final answer."),
+        ]
+        agent = Agent()
+        agent._execute_tool = MagicMock(return_value=large_result)
+        agent.run("Summarize sales", sample_df)
+
+    final_messages = mock_llm.chat.call_args_list[-1].args[0]
+    assert _estimate_request_chars(final_messages) <= MAX_LLM_REQUEST_CHARS
+    assert "Result truncated" in final_messages[1]["content"]
 
 
 

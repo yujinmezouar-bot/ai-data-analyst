@@ -1,0 +1,7 @@
+warning: in the working copy of 'agent/agent.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'app.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_agent.py', LF will be replaced by CRLF the next time Git touches it
+ agent/agent.py      | 161 [32m++++++++++++++++++++++[m[31m------------------------------[m
+ app.py              |  40 [32m+++++[m[31m--------[m
+ tests/test_agent.py |  51 [32m+++++++++++++++++[m
+ 3 files changed, 135 insertions(+), 117 deletions(-)

@@ -69,6 +69,9 @@ MAX_TOOL_ITERATIONS = 4
 # it gets truncated before being sent to either LLM call.
 MAX_TOOL_RESULT_CHARS = 4000
 MAX_TRUNCATED_ENTRIES = 25
+# Conservative character budget (~6k tokens) for a model environment with an
+# 8k TPM limit. Tool schemas are included because providers count them too.
+MAX_LLM_REQUEST_CHARS = 24000
 
 
 def _build_execution_plan(question: str) -> str | None:
@@ -86,6 +89,52 @@ def _build_execution_plan(question: str) -> str | None:
     ):
         return "Run the requested analyses in sequence and combine the relevant results."
     return None
+
+
+def _estimate_request_chars(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None) -> int:
+    """Conservative, dependency-free request-size estimate."""
+    return len(json.dumps({"messages": messages, "tools": tools or []}, default=str))
+
+
+def _compact_messages_for_request(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    current_question: str | None = None,
+) -> list[dict[str, Any]]:
+    """Keep system, current question, and newest context within the request budget."""
+    if _estimate_request_chars(messages, tools) <= MAX_LLM_REQUEST_CHARS:
+        return messages
+
+    required = {0, len(messages) - 1}
+    if current_question is not None:
+        for index in range(len(messages) - 1, 0, -1):
+            if messages[index].get("role") == "user" and messages[index].get("content") == current_question:
+                required.add(index)
+                break
+
+    selected = set(required)
+    for index in range(len(messages) - 2, 0, -1):
+        candidate = [message for i, message in enumerate(messages) if i in selected | {index}]
+        if _estimate_request_chars(candidate, tools) <= MAX_LLM_REQUEST_CHARS:
+            selected.add(index)
+
+    compacted = [message for index, message in enumerate(messages) if index in selected]
+    # A very large newest tool-result message is reduced only after preserving
+    # the current question, system instructions, and its leading key findings.
+    while _estimate_request_chars(compacted, tools) > MAX_LLM_REQUEST_CHARS and len(compacted) > 2:
+        removable = next((i for i, message in enumerate(compacted[1:-1], start=1)
+                          if message.get("content") != current_question), None)
+        if removable is None:
+            break
+        compacted.pop(removable)
+    if _estimate_request_chars(compacted, tools) > MAX_LLM_REQUEST_CHARS:
+        last = compacted[-1]
+        content = str(last.get("content", ""))
+        allowance = max(500, MAX_LLM_REQUEST_CHARS - _estimate_request_chars(compacted[:-1], tools) - 200)
+        last = dict(last)
+        last["content"] = content[:allowance] + "\n[Context compacted for request size.]"
+        compacted[-1] = last
+    return compacted
 
 
 def _compact_tool_result(result: Any) -> Any:
@@ -439,97 +488,19 @@ FORBIDDEN PATTERNS:
 # ============================================================
 
 SYSTEM_PROMPT = (
-    "You are a professional data analyst assistant working with a pandas DataFrame. "
-
-    "IMPORTANT: The actual dataset is available to the Python tools. You must NEVER "
-    "claim that the actual data values are unavailable. "
-
-    "CONVERSATIONAL QUESTIONS: For greetings, general capabilities, or questions not "
-    "requiring dataset calculations (e.g. 'hello', 'what can you do?'), respond directly "
-    "with helpful text without calling any tools. "
-
-    "TOOL SELECTION GUIDELINES: "
-    "- Match the question to the minimum sufficient analysis: rankings and category comparisons use groupby_analysis; "
-    "descriptive distributions use statistics; missing-data checks use missing_values; trends use time_analysis; "
-    "period-over-period comparisons use percentage_change; relationships use correlation_analysis; "
-    "unusual values use outlier_analysis; and dataset structure uses dataset_info only when the compact dataset context is insufficient. "
-    "- Use dataset_info ONLY for questions about dataset structure (rows, columns, "
-    "column names, data types, detected date columns, memory usage). "
-
-    "- Use missing_values for questions about missing, null, or NaN values and completeness. "
-
-    "- Use statistics for descriptive statistics (mean, median, std, min, max, "
-    "quartiles) of one or all numeric columns, when there is NO grouping or time "
-    "breakdown involved. "
-
-    "- Use groupby_analysis when the user asks for a calculation BY, PER, FOR EACH, "
-    "or ACROSS a CATEGORICAL column (not a time breakdown). Set top_n + sort_order "
-    "for 'top N' / 'bottom N' / 'highest' / 'lowest' questions. Set filter_values "
-    "to restrict to specific categories mentioned earlier in the conversation. "
-
-    "- Use time_analysis whenever the question involves day/week/month/quarter/year "
-    "breakdowns, trends over time, a specific year, a date range, comparing years, "
-    "or which period was highest/lowest/best/worst. time_analysis returns "
-    "best_period and worst_period directly -- read them, do not compute them "
-    "yourself. To compare specific categories over time (e.g. 'compare those "
-    "stores by month'), set time_analysis's group_column and filter_values. "
-
-    "- Use correlation_analysis for questions about relationships between numeric "
-    "variables, e.g. 'what is correlated with sales?' or 'strongest correlations "
-    "in the dataset'. "
-
-    "- Use outlier_analysis for questions about unusual/extreme values, e.g. 'are "
-    "there outliers in sales?' or 'which columns have many outliers?'. "
-
-    "- Use percentage_change for questions comparing periods, e.g. 'how did sales "
-    "change from 2024 to 2025?', 'percentage increase in sales', 'compare this "
-    "month to the previous month', or 'which month had the largest increase?'. "
-    "It already computes absolute_change and percentage_change (including safe "
-    "handling when the previous value is zero) -- read them, do not compute them "
-    "yourself. "
-
-    "- Use create_visualization for charts. If the request implies an aggregated "
-    "view ('average sales by store', 'sales by month', 'top 10 stores'), you MUST "
-    "set agg_function (and period, for a datetime x_column) -- otherwise the chart "
-    "plots raw rows instead of the aggregated values, which is wrong. "
-
-    "EFFICIENCY AND FOLLOW-UPS: "
-    "- Use the compact dataset context and recent conversation to resolve column names, entities, and references such as 'their', 'those stores', or 'the worst one'. "
-    "- If a prior tool result already contains the requested ranking, best/worst group, comparison, trend, or correlation, use it; do not call another tool merely to recompute it. "
-    "- For an entity/subset workflow, first obtain the entities with groupby_analysis when needed, then pass the exact returned names as filter_values to the next tool. Never invent filter values. "
-    "- Stop as soon as available results answer the question. Use create_visualization only when a chart materially improves a trend, distribution, multi-category comparison, or numeric relationship. "
-    "- If the dataset context and conversation cannot identify the relevant column, entity, or comparison unambiguously, ask one concise clarification rather than guessing. "
-
-    "MULTI-STEP REASONING: "
-    "For questions that require multiple steps (for example: identifying the top 3 "
-    "categories and then charting or trending them over time): "
-    "1. Call the initial tool (e.g. groupby_analysis with top_n=3). "
-    "2. Inspect the result to extract the top category names. "
-    "3. Call the next tool (e.g. time_analysis or create_visualization) passing those "
-    "names into filter_values. "
-    "4. Stop calling tools once you have collected all data necessary to answer. "
-
-    "STATISTICAL & COMPARATIVE REASONING: "
-    "- Clearly distinguish difference, percentage difference, and percentage change. "
-    "Difference = B - A; Percentage difference = |B - A| / ((A+B)/2); Percentage change = (B - A) / A. "
-    "The Python tools calculate these exact values for you. "
-    "- Clearly distinguish correlation from causation. A strong statistical correlation "
-    "does NOT prove causation. State findings as associations or relationships, never causation. "
-    "- Read trend directions (strictly_increasing, increasing, decreasing, stable, fluctuating) "
-    "directly from time_analysis results rather than eyeballing or extrapolating. "
-    "- For 'why did X change?' questions, investigate contributing sub-categories (e.g. by comparing "
-    "group breakdowns) after identifying the change with time_analysis or percentage_change when applicable. "
-    "Report observed contributors as associations only; do not claim they caused the change or invent external real-world causes. "
-    "- Call create_visualization when the user asks for a chart or when a visual trend/distribution "
-    "adds strong analytical value; do not generate charts for simple scalar lookups. "
-
-    "GENERAL PRINCIPLES: "
-    "- Always use a tool when the question requires facts or numbers from the dataset. "
-    "- Never guess, invent, or manually calculate numbers yourself -- the Python tools "
-    "perform every calculation. "
-    "- Do not call unrelated tools or repeat the same tool call if the result is already available. "
-    "- Resolve references from conversation context (e.g. 'those stores', 'the top one', 'for 2024') "
-    "to the correct column names or values before calling tools."
+    "You are a data analyst using deterministic pandas tools; the dataset is available to them. "
+    "For greetings or non-data questions answer directly. For data facts, use the minimum sufficient tool: "
+    "rankings and category comparisons use groupby_analysis; descriptive distributions use statistics; missing-data checks use missing_values; "
+    "trends use time_analysis; period-over-period comparisons use percentage_change; relationships use correlation_analysis; unusual values use outlier_analysis; "
+    "dataset structure uses dataset_info only when the compact dataset context is insufficient. "
+    "and charts=create_visualization only when they materially help. Set aggregation (and date period) for aggregated charts. "
+    "Use compact context and recent conversation to resolve columns and references. For multi-step work, pass exact returned "
+    "entities into filter_values. Never invent filter values. Reuse available rankings, trends, comparisons, and correlations; stop when sufficient. "
+    "If intent remains ambiguous, ask one concise clarification. Python provides exact metrics: do not calculate or guess. "
+    "Distinguish absolute difference, percentage difference, and percentage change; read trend_direction directly. "
+    "Correlation is association, never causation. For 'why' questions investigate after identifying the change with time_analysis or percentage_change, then report observed contributors as associations only. "
+    "Explain tool errors, limited data, filters, and truncation honestly. Do not repeat tool calls or dump raw data. "
+    "Call create_visualization when useful; do not generate charts for simple scalar lookups."
 )
 
 
@@ -596,7 +567,10 @@ class Agent:
         # ------------------------------------------------------------
         while iterations < MAX_TOOL_ITERATIONS:
 
-            response_message = self.llm.chat(working_messages, tools=TOOL_SCHEMAS)
+            decision_messages = _compact_messages_for_request(
+                working_messages, tools=TOOL_SCHEMAS, current_question=question
+            )
+            response_message = self.llm.chat(decision_messages, tools=TOOL_SCHEMAS)
             tool_calls = getattr(response_message, "tool_calls", None)
 
             if not tool_calls:
@@ -737,6 +711,9 @@ class Agent:
             },
         ]
 
+        final_messages = _compact_messages_for_request(
+            final_messages, current_question=question
+        )
         final_message = self.llm.chat(final_messages, tool_choice="none")
 
         trace.append({"step": "final_answer", "tool_used": True, "iterations": iterations})

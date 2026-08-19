@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 
 from agent.agent import Agent, MAX_HISTORY_MESSAGES
-from tools.date_utils import convert_date_columns
+from ui_utils import dataset_signature, load_dataset, user_error_message
 
 
 st.set_page_config(page_title="AI Data Analyst", layout="wide")
@@ -33,24 +33,7 @@ if "detected_dates" not in st.session_state:
 
 # ============================================================
 # DATASET LOADER
-# Date detection/conversion is consolidated into a single
-# implementation (tools/date_utils.py) -- there is no separate
-# date-parsing logic in this file anymore.
 # ============================================================
-
-def load_dataset(uploaded_file) -> tuple[pd.DataFrame, dict]:
-    filename = uploaded_file.name.lower()
-
-    if filename.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    elif filename.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(uploaded_file)
-    else:
-        raise ValueError("Unsupported file type. Please upload a .csv or .xlsx file.")
-
-    df, detected_dates = convert_date_columns(df)
-    return df, detected_dates
-
 
 def get_agent() -> Agent:
     if st.session_state.agent is None:
@@ -66,12 +49,13 @@ uploaded_file = st.file_uploader("Upload your dataset", type=["csv", "xlsx", "xl
 
 if uploaded_file is not None:
     try:
+        upload_signature = dataset_signature(uploaded_file)
         if (
-            "uploaded_filename" not in st.session_state
-            or st.session_state.uploaded_filename != uploaded_file.name
+            "uploaded_signature" not in st.session_state
+            or st.session_state.uploaded_signature != upload_signature
         ):
             st.session_state.df, st.session_state.detected_dates = load_dataset(uploaded_file)
-            st.session_state.uploaded_filename = uploaded_file.name
+            st.session_state.uploaded_signature = upload_signature
 
             # New dataset = new conversation.
             st.session_state.messages = []
@@ -87,8 +71,9 @@ if uploaded_file is not None:
             st.caption(f"Detected date column(s): {date_summary}")
 
     except Exception as e:
-        st.error(f"Failed to load file: {e}")
+        st.error(user_error_message(e, action="upload") if not isinstance(e, ValueError) else str(e))
         st.session_state.df = None
+        st.session_state.last_figure = None
 
 
 # ============================================================
@@ -115,6 +100,9 @@ if df is not None:
 
     st.subheader("Preview (first 5 rows)")
     st.dataframe(df.head(), use_container_width=True)
+
+    if df.select_dtypes(include="number").empty:
+        st.warning("This dataset has no numeric columns. Structural and missing-data questions are still available.")
 
     # ========================================================
     # CONVERSATION
@@ -151,7 +139,8 @@ if df is not None:
             st.warning("Please enter a question first.")
         else:
             try:
-                with st.spinner("Thinking..."):
+                st.session_state.last_figure = None
+                with st.spinner("Analyzing your dataset, running tools if needed, and generating the final answer..."):
                     agent = get_agent()
                     result = agent.run(
                         question,
@@ -170,7 +159,8 @@ if df is not None:
                 st.rerun()
 
             except Exception as e:
-                st.error(f"Something went wrong: {e}")
+                st.session_state.last_figure = None
+                st.error(user_error_message(e))
 
     if st.session_state.last_figure is not None:
         st.subheader("Visualization")
