@@ -12,6 +12,7 @@ from agent.agent import (
     MAX_TOOL_ITERATIONS,
     SYSTEM_PROMPT,
     Agent,
+    _build_execution_plan,
     _compact_tool_result,
     _summarise_tool_results,
 )
@@ -598,6 +599,80 @@ def test_v55_follow_up_history_is_available_for_entity_resolution(sample_df: pd.
         decision_messages = mock_llm.chat.call_args.args[0]
         assert history[1] in decision_messages
         assert decision_messages[-1]["content"] == "Show their trend over time"
+
+
+def test_v56_complex_requests_receive_action_only_plan(sample_df: pd.DataFrame):
+    """Complex workflows get a concise trace plan; simple requests do not."""
+    assert _build_execution_plan("Show the sales trend of the top 3 stores") == (
+        "Rank the requested entities, then analyze the selected entities over time."
+    )
+    assert _build_execution_plan("What is the average sales?") is None
+
+    with patch("agent.agent.LLMClient") as MockLLM:
+        MockLLM.return_value.chat.return_value = _make_text_msg("I can help with that.")
+        result = Agent().run("Show the sales trend of the top 3 stores", sample_df)
+
+    assert result["trace"][1] == {
+        "step": "plan",
+        "summary": "Rank the requested entities, then analyze the selected entities over time.",
+    }
+    assert "Weekly_Sales" not in result["trace"][1]["summary"]
+
+
+def test_v56_trace_records_order_success_and_duplicate_reuse(sample_df: pd.DataFrame):
+    """Trace remains action-oriented while making cache reuse auditable."""
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.side_effect = [
+            _make_tool_msg("statistics", {"column": "Weekly_Sales"}),
+            _make_tool_msg("statistics", {"column": "Weekly_Sales"}),
+            _make_text_msg("Sufficient."),
+            _make_text_msg("The mean is 225.0."),
+        ]
+
+        result = Agent().run("What is the mean sales?", sample_df)
+
+    tool_steps = [step for step in result["trace"] if step["step"] == "tool_call"]
+    assert [step["iteration"] for step in tool_steps] == [0, 1]
+    assert [step["success"] for step in tool_steps] == [True, True]
+    assert [step["reused"] for step in tool_steps] == [False, True]
+    assert tool_steps[1]["arguments"] == {"column": "Weekly_Sales"}
+
+
+def test_v56_sufficiency_and_filtered_scope_are_in_final_prompt(sample_df: pd.DataFrame):
+    """Limited evidence and filtered scope are passed deterministically to final synthesis."""
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.side_effect = [
+            _make_tool_msg("time_analysis", {
+                "date_column": "Date", "value_column": "Weekly_Sales", "period": "year",
+                "group_column": "Store", "filter_values": ["C", "B"],
+            }),
+            _make_text_msg("Sufficient."),
+            _make_text_msg("Among the selected stores, the available evidence is limited."),
+        ]
+
+        Agent().run("Compare the top stores over time", sample_df)
+
+    final_prompt = mock_llm.chat.call_args_list[-1].args[0][1]["content"]
+    assert "Filtered scope: Store in ['C', 'B']" in final_prompt
+    assert "DATA SUFFICIENCY: time_analysis: limited data (1 period(s))" in final_prompt
+    assert "do not invent a numerical confidence score" in FINAL_EXPLANATION_SYSTEM_PROMPT
+
+
+def test_v56_insufficient_data_is_distinguished_from_no_result():
+    """Known data-sufficiency errors receive a clear limitation instruction."""
+    summary = _summarise_tool_results([
+        {"tool_name": "correlation_analysis", "result": {
+            "error": "Not enough numeric columns with variance to compute correlations (found 1).",
+        }},
+        {"tool_name": "statistics", "result": {"column": "Sales", "count": 2}},
+    ], has_figure=False)
+
+    assert "FAILED" in summary
+    assert "correlation_analysis: insufficient data for this analysis" in summary
+    assert "statistics: limited data (2 observation(s))" in summary
+    assert "do not draw a stronger conclusion" in summary
 
 
 

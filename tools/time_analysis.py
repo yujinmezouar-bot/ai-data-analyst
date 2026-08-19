@@ -108,14 +108,18 @@ def time_analysis(
                 result.setdefault(label, {})
                 result[label][str(group_key)] = None if pd.isna(value) else round(float(value), 2)
 
-            return {
+            output = {
                 "date_column": date_column,
                 "value_column": value_column,
                 "group_column": group_column,
                 "period": period,
                 "agg_function": agg_function,
                 "result": result,
+                "total_periods": len(result),
             }
+            if filter_values:
+                output["filter_applied"] = {"column": group_column, "values": filter_values}
+            return output
 
         else:
             series, _ = aggregate_series(working_df, "_bucket", value_column, agg_function)

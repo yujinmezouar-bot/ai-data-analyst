@@ -71,6 +71,23 @@ MAX_TOOL_RESULT_CHARS = 4000
 MAX_TRUNCATED_ENTRIES = 25
 
 
+def _build_execution_plan(question: str) -> str | None:
+    """Return a concise, user-safe plan only for clearly multi-step requests."""
+    text = question.lower()
+    time_terms = ("trend", "over time", "monthly", "weekly", "quarter", "yearly")
+    ranking_terms = ("top ", "bottom ", "best", "worst", "highest", "lowest")
+
+    if "why" in text and any(term in text for term in ("change", "increase", "decrease", "grew", "decline")):
+        return "Identify the observed change, then examine relevant groups for associated contributors."
+    if any(term in text for term in time_terms) and any(term in text for term in ranking_terms):
+        return "Rank the requested entities, then analyze the selected entities over time."
+    if any(term in text for term in ("compare", "relationship", "correlation")) and any(
+        term in text for term in time_terms
+    ):
+        return "Run the requested analyses in sequence and combine the relevant results."
+    return None
+
+
 def _compact_tool_result(result: Any) -> Any:
     """
     Safety net against oversized tool outputs. The tools themselves
@@ -137,6 +154,7 @@ def _summarise_tool_results(
     hints: list[str] = []
     any_truncated = False
     any_error = False
+    sufficiency: list[str] = []
 
     for item in all_tool_results:
         tool = item["tool_name"]
@@ -147,6 +165,11 @@ def _summarise_tool_results(
         if "error" in res:
             any_error = True
             hints.append(f"[{tool}] FAILED: {res['error']}")
+            error_text = str(res["error"]).lower()
+            if any(marker in error_text for marker in (
+                "no rows", "no data", "not enough", "no numeric", "no valid", "constant", "no variance",
+            )):
+                sufficiency.append(f"{tool}: insufficient data for this analysis")
             continue
 
         if "note" in res and "truncated" in str(res.get("note", "")).lower():
@@ -167,6 +190,9 @@ def _summarise_tool_results(
             if oc is not None:
                 pct_str = f" ({op:+.1f}%)" if op is not None else ""
                 hints.append(f"[time_analysis] Overall change: {oc:+g}{pct_str}")
+            periods = res.get("total_periods")
+            if isinstance(periods, int) and periods < 3:
+                sufficiency.append(f"time_analysis: limited data ({periods} period(s))")
 
         elif tool == "percentage_change":
             cs = res.get("comparison_summary")
@@ -224,6 +250,9 @@ def _summarise_tool_results(
         elif tool == "statistics":
             single_col = res.get("column")
             if single_col:
+                count = res.get("count")
+                if isinstance(count, int) and count < 3:
+                    sufficiency.append(f"statistics: limited data ({count} observation(s))")
                 skew = res.get("skewness")
                 cv = res.get("coefficient_of_variation")
                 if skew is not None and abs(float(skew)) > 1:
@@ -310,6 +339,13 @@ def _summarise_tool_results(
                     )
                     hints.append(f"[outlier_analysis] Columns with outliers: {summary}")
 
+        filter_applied = res.get("filter_applied")
+        if isinstance(filter_applied, dict):
+            column = filter_applied.get("column")
+            values = filter_applied.get("values")
+            if column and isinstance(values, list):
+                hints.append(f"[{tool}] Filtered scope: {column} in {values}")
+
     lines: list[str] = []
     if hints:
         lines.append("KEY ANALYTICAL FINDINGS (extracted by Python):\n" + "\n".join(hints))
@@ -328,6 +364,11 @@ def _summarise_tool_results(
         lines.append(
             "NOTE: One or more tools reported an error. For failed analyses, explain "
             "clearly what could not be determined and why, rather than inventing a result."
+        )
+    if sufficiency:
+        lines.append(
+            "DATA SUFFICIENCY: " + "; ".join(dict.fromkeys(sufficiency)) + ". "
+            "State this as a limitation and do not draw a stronger conclusion."
         )
 
     return "\n\n".join(lines)
@@ -355,6 +396,8 @@ GROUNDING RULES (mandatory):
 4. If a tool call failed, explain what could NOT be determined — do not fabricate an alternative answer.
 5. If results were truncated, acknowledge that the conclusion is based on the available subset.
 6. Do NOT claim that any analysis was performed if no tool result confirms it.
+7. When DATA SUFFICIENCY is provided, state whether the evidence is limited or insufficient; do not invent a numerical confidence score.
+8. When a filtered scope is provided, make clear that the finding applies to that subset rather than the entire dataset.
 
 INSIGHT EXTRACTION — when relevant, surface:
 • Comparisons: best/worst group, absolute difference, percentage change, percentage difference (they are NOT the same thing)
@@ -543,6 +586,9 @@ class Agent:
         all_tool_results: list[dict[str, Any]] = []
         executed_calls_cache: dict[tuple[str, str], Any] = {}
         trace: list[dict[str, Any]] = [{"step": "question", "question": question}]
+        plan = _build_execution_plan(question)
+        if plan:
+            trace.append({"step": "plan", "summary": plan})
         iterations = 0
 
         # ------------------------------------------------------------
@@ -587,6 +633,7 @@ class Agent:
                         "hint": "Retry this tool call with a valid JSON arguments object matching its schema.",
                     }
                     success = False
+                    reused = False
                 else:
                     call_key = (tool_name, json.dumps(tool_args, sort_keys=True))
                     if call_key in executed_calls_cache:
@@ -600,9 +647,11 @@ class Agent:
                         else:
                             tool_result = cached_result
                         success = not (isinstance(tool_result, dict) and "error" in tool_result)
+                        reused = True
                     else:
                         tool_result = self._execute_tool(tool_name, tool_args, df)
                         success = not (isinstance(tool_result, dict) and "error" in tool_result)
+                        reused = False
                         if isinstance(tool_result, dict):
                             executed_calls_cache[call_key] = dict(tool_result)
                         else:
@@ -621,6 +670,7 @@ class Agent:
                     "tool": tool_name,
                     "arguments": tool_args if not args_malformed else raw_arguments,
                     "success": success,
+                    "reused": reused,
                     "error": tool_result.get("error") if isinstance(tool_result, dict) else None,
                 })
 

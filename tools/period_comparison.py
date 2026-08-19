@@ -103,7 +103,7 @@ def percentage_change(
         pct_diff = round(100.0 * abs(abs_diff) / mean_val, 2) if mean_val != 0 else None
         comp_summary = "increased" if value_2 > value_1 else ("decreased" if value_2 < value_1 else "unchanged")
 
-        return {
+        output = {
             "date_column": date_column,
             "value_column": value_column,
             "agg_function": agg_function,
@@ -116,6 +116,9 @@ def percentage_change(
             "percentage_difference": pct_diff,
             "comparison_summary": comp_summary,
         }
+        if group_column is not None and filter_values:
+            output["filter_applied"] = {"column": group_column, "values": filter_values}
+        return output
 
     # ------------------------------------------------------------
     # Mode 2: period-over-period comparison, reusing the same
@@ -178,6 +181,8 @@ def percentage_change(
             f"Showing the most recent {MAX_PERIODS_RETURNED} of {len(changes)} period-over-period "
             "changes. largest_increase/largest_decrease were computed over the full range."
         )
+    if group_column is not None and filter_values:
+        output["filter_applied"] = {"column": group_column, "values": filter_values}
     return output
 
 
