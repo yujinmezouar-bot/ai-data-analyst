@@ -23,7 +23,7 @@ def create_visualization(
     y_column: str | None = None,
     agg_function: str | None = None,
     period: str | None = None,
-    filter_values: list[str] | None = None,
+    filter_values: list[str | int | float] | None = None,
     top_n: int | None = None,
     sort_order: str | None = None,
 ) -> dict[str, Any]:
@@ -232,8 +232,8 @@ CREATE_VISUALIZATION_SCHEMA = {
                 },
                 "filter_values": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Restrict x_column to only these values, e.g. specific store names from earlier in the conversation.",
+                    "items": {"type": ["string", "number"]},
+                    "description": "Restrict x_column to exact string or numeric category values from earlier in the conversation.",
                 },
             },
             "required": ["chart_type", "x_column"],

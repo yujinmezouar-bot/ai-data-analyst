@@ -29,7 +29,7 @@ def percentage_change(
     year_1: int | None = None,
     year_2: int | None = None,
     group_column: str | None = None,
-    filter_values: list[str] | None = None,
+    filter_values: list[str | int | float] | None = None,
 ) -> dict[str, Any]:
     """
     Compare a numeric column across time periods.
@@ -210,7 +210,7 @@ PERCENTAGE_CHANGE_SCHEMA = {
                 "year_1": {"type": ["integer", "null"], "description": "Earlier/baseline year for an explicit year-vs-year comparison, e.g. 2024. Omit or set null for period-over-period mode."},
                 "year_2": {"type": ["integer", "null"], "description": "Later/comparison year for an explicit year-vs-year comparison, e.g. 2025. Omit or set null for period-over-period mode."},
                 "group_column": {"type": ["string", "null"], "description": "Optional categorical column to restrict via filter_values. Set to null (or omit) for no grouping."},
-                "filter_values": {"type": ["array", "null"], "items": {"type": "string"}, "description": "Restrict group_column to specific values. Set to null (or omit) for no filtering."},
+                "filter_values": {"type": ["array", "null"], "items": {"type": ["string", "number"]}, "description": "Restrict group_column to exact string or numeric categorical values. Set to null (or omit) for no filtering."},
             },
             "required": ["date_column", "value_column"],
         },

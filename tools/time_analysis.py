@@ -16,7 +16,7 @@ def time_analysis(
     start_date: str | None = None,
     end_date: str | None = None,
     group_column: str | None = None,
-    filter_values: list[str] | None = None,
+    filter_values: list[str | int | float] | None = None,
 ) -> dict[str, Any]:
     """
     Aggregate a numeric column over time, bucketed into day/week/month/
@@ -200,7 +200,7 @@ TIME_ANALYSIS_SCHEMA = {
                 "start_date": {"type": "string", "description": "Restrict to dates on/after this date, format YYYY-MM-DD."},
                 "end_date": {"type": "string", "description": "Restrict to dates on/before this date, format YYYY-MM-DD."},
                 "group_column": {"type": "string", "description": "Optional secondary categorical column, e.g. 'Store', for 'compare those stores by month'."},
-                "filter_values": {"type": "array", "items": {"type": "string"}, "description": "Restrict group_column to specific values, e.g. store names identified earlier."},
+                "filter_values": {"type": "array", "items": {"type": ["string", "number"]}, "description": "Restrict group_column to exact values, e.g. store names or numeric store IDs identified earlier."},
             },
             "required": ["date_column", "value_column"],
         },

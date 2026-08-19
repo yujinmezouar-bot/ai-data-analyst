@@ -55,7 +55,7 @@ def groupby_analysis(
     group_column: str,
     value_column: str,
     agg_function: str = "mean",
-    filter_values: list[str] | None = None,
+    filter_values: list[str | int | float] | None = None,
     top_n: int | None = None,
     sort_order: str | None = None,
 ) -> dict[str, Any]:
@@ -217,8 +217,8 @@ GROUPBY_ANALYSIS_SCHEMA = {
                 },
                 "filter_values": {
                     "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Restrict group_column to only these values, e.g. specific store names.",
+                    "items": {"type": ["string", "number"]},
+                    "description": "Restrict group_column to exact categorical values (strings or numeric IDs), e.g. store names or store numbers.",
                 },
             },
             "required": ["group_column", "value_column"],
