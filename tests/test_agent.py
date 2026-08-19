@@ -7,10 +7,13 @@ import plotly.graph_objects as go
 import pytest
 
 from agent.agent import (
+    FINAL_EXPLANATION_SYSTEM_PROMPT,
     MAX_HISTORY_MESSAGES,
     MAX_TOOL_ITERATIONS,
+    SYSTEM_PROMPT,
     Agent,
     _compact_tool_result,
+    _summarise_tool_results,
 )
 
 
@@ -416,6 +419,100 @@ def test_agent_analytical_trend_workflow(sample_df: pd.DataFrame):
         tool_steps = [t for t in res["trace"] if t.get("step") == "tool_call"]
         assert len(tool_steps) == 1
         assert tool_steps[0]["tool"] == "time_analysis"
+
+
+def test_v54_direct_answers_remain_concise(sample_df: pd.DataFrame):
+    """V5.4 keeps non-analytical replies on the existing direct-answer path."""
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.return_value = _make_text_msg("Hello! What would you like to analyze?")
+
+        result = Agent().run("Hello", sample_df)
+
+        assert result["answer"] == "Hello! What would you like to analyze?"
+        assert result["trace"][-1] == {"step": "final_answer", "tool_used": False}
+        assert mock_llm.chat.call_count == 1
+
+
+def test_v54_final_answer_prompt_is_grounded_and_structured(sample_df: pd.DataFrame):
+    """The isolated final call receives deterministic findings and grounding rules."""
+    with patch("agent.agent.LLMClient") as MockLLM:
+        mock_llm = MockLLM.return_value
+        mock_llm.chat.side_effect = [
+            _make_tool_msg("time_analysis", {
+                "date_column": "Date", "value_column": "Weekly_Sales", "period": "month",
+            }),
+            _make_text_msg("Tools complete."),
+            _make_text_msg("Conclusion: sales increased.\n\nKey findings\n- The trend was strictly_increasing."),
+        ]
+
+        result = Agent().run("Analyze the sales trend", sample_df)
+
+        assert result["answer"].startswith("Conclusion:")
+        final_messages = mock_llm.chat.call_args_list[-1].args[0]
+        assert mock_llm.chat.call_args_list[-1].kwargs["tool_choice"] == "none"
+        assert final_messages[0]["content"] == FINAL_EXPLANATION_SYSTEM_PROMPT
+        assert "Trend direction: strictly_increasing" in final_messages[1]["content"]
+        assert "use ONLY the values returned by the tools" in FINAL_EXPLANATION_SYSTEM_PROMPT
+
+
+def test_v54_insight_summary_covers_comparison_correlation_and_limitations():
+    """V5.4 surfaces existing tool metrics without recalculating them."""
+    tool_results = [
+        {"tool_name": "percentage_change", "result": {
+            "comparison_summary": "increased", "absolute_change": 25.0,
+            "percentage_change": 12.5,
+        }},
+        {"tool_name": "correlation_analysis", "result": {
+            "strongest_positive": ("Advertising", 0.8),
+            "strongest_negative": ("Price", -0.4),
+        }},
+        {"tool_name": "groupby_analysis", "result": {
+            "result": {"North": 120.0, "South": 95.0},
+            "ranking": ["North", "South"], "best_group": "North", "worst_group": "South",
+        }},
+        {"tool_name": "statistics", "result": {"column": "Sales", "skewness": 1.2, "coefficient_of_variation": 1.1}},
+        {"tool_name": "time_analysis", "result": {"note": "Result truncated to the available subset."}},
+    ]
+
+    summary = _summarise_tool_results(tool_results, has_figure=True)
+
+    assert "absolute change +25 (+12.5%)" in summary
+    assert "Advertising (r=0.800)" in summary
+    assert "Price (r=-0.400)" in summary
+    assert "Leading ranking: North (120), South (95)" in summary
+    assert "notably right (positively) skewed" in summary
+    assert "chart was generated" in summary
+    assert "truncated" in summary.lower()
+
+
+def test_v54_insight_summary_reports_missing_values_and_outliers():
+    """Missing-data and both outlier result shapes receive deterministic hints."""
+    summary = _summarise_tool_results([
+        {"tool_name": "missing_values", "result": {
+            "total_missing_values": 4,
+            "columns_with_missing": {"Discount": {"missing_count": 3, "missing_percentage": 50.0}},
+        }},
+        {"tool_name": "outlier_analysis", "result": {
+            "column": "Sales", "outlier_count": 2, "outlier_percentage": 10.0,
+            "example_outlier_values": [900.0],
+        }},
+        {"tool_name": "outlier_analysis", "result": {
+            "results": {"Profit": {"outlier_count": 1}},
+        }},
+    ], has_figure=False)
+
+    assert "Discount (3 missing; 50.0%)" in summary
+    assert "Sales has 2 outlier(s) (10.0%)" in summary
+    assert "Profit (1 outlier(s))" in summary
+
+
+def test_v54_why_and_visualization_guidance_is_explicit():
+    """Tool selection guidance preserves association language and chart restraint."""
+    assert "after identifying the change with time_analysis or percentage_change" in SYSTEM_PROMPT
+    assert "associations only" in SYSTEM_PROMPT
+    assert "create_visualization" in SYSTEM_PROMPT
+    assert "do not generate charts for simple scalar lookups" in SYSTEM_PROMPT
 
 
 

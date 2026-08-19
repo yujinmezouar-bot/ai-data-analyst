@@ -209,6 +209,18 @@ def _summarise_tool_results(
                     f"abs diff {comp['absolute_difference']:g}{pct_str}"
                 )
 
+            ranking = res.get("ranking")
+            values = res.get("result")
+            if isinstance(ranking, list) and isinstance(values, dict) and ranking:
+                top_ranked = ranking[:3]
+                ranking_text = ", ".join(
+                    f"{group} ({values[group]:g})"
+                    for group in top_ranked
+                    if isinstance(values.get(group), (int, float))
+                )
+                if ranking_text:
+                    hints.append(f"[groupby_analysis] Leading ranking: {ranking_text}")
+
         elif tool == "statistics":
             single_col = res.get("column")
             if single_col:
@@ -222,6 +234,28 @@ def _summarise_tool_results(
                     )
                 if cv is not None and float(cv) > 1.0:
                     hints.append(f"[statistics] '{single_col}' has high variability (CV={float(cv):.2f})")
+
+        elif tool == "missing_values":
+            total_missing = res.get("total_missing_values")
+            missing_columns = res.get("columns_with_missing")
+            if total_missing == 0:
+                hints.append("[missing_values] No missing values were found.")
+            elif isinstance(missing_columns, dict):
+                most_affected = sorted(
+                    missing_columns.items(),
+                    key=lambda item: item[1].get("missing_percentage", 0),
+                    reverse=True,
+                )[:3]
+                summary = ", ".join(
+                    f"{column} ({info.get('missing_count')} missing; "
+                    f"{info.get('missing_percentage')}%)"
+                    for column, info in most_affected
+                    if isinstance(info, dict)
+                )
+                if summary:
+                    hints.append(
+                        f"[missing_values] {total_missing} missing value(s); most affected: {summary}"
+                    )
 
         elif tool == "correlation_analysis":
             sp = res.get("strongest_positive")
@@ -250,7 +284,17 @@ def _summarise_tool_results(
                 )
 
         elif tool == "outlier_analysis":
-            sc = res.get("summary_by_column")
+            # Single-column results are returned at the top level, while
+            # multi-column results use the `results` mapping.
+            if res.get("column") and res.get("outlier_count", 0) > 0:
+                examples = res.get("example_outlier_values", [])
+                example_text = f"; examples: {examples}" if examples else ""
+                hints.append(
+                    f"[outlier_analysis] {res['column']} has {res['outlier_count']} "
+                    f"outlier(s) ({res.get('outlier_percentage')}%){example_text}"
+                )
+
+            sc = res.get("results")
             if isinstance(sc, dict):
                 notable = [
                     (col, info)
@@ -420,7 +464,8 @@ SYSTEM_PROMPT = (
     "- Read trend directions (strictly_increasing, increasing, decreasing, stable, fluctuating) "
     "directly from time_analysis results rather than eyeballing or extrapolating. "
     "- For 'why did X change?' questions, investigate contributing sub-categories (e.g. by comparing "
-    "group breakdowns) and report observed contributors without inventing external real-world causes. "
+    "group breakdowns) after identifying the change with time_analysis or percentage_change when applicable. "
+    "Report observed contributors as associations only; do not claim they caused the change or invent external real-world causes. "
     "- Call create_visualization when the user asks for a chart or when a visual trend/distribution "
     "adds strong analytical value; do not generate charts for simple scalar lookups. "
 
