@@ -1,5 +1,5 @@
 import os
-from typing import Any
+from typing import Any, Protocol
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -16,22 +16,37 @@ DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 
 # ============================================================
-# LLM CLIENT
+# LLM Provider abstraction
 # ============================================================
 
-class LLMClient:
-    """
-    Thin abstraction around the Groq API.
+class LLMProvider(Protocol):
+    """Protocol for pluggable LLM providers used by the Agent.
 
-    The rest of the application should only communicate
-    with this class, not directly with the Groq package.
+    The provider must implement a chat(...) method with the same
+    signature and return value expectations as the current LLMClient.
     """
 
-    def __init__(
+    def chat(
         self,
-        model: str = DEFAULT_MODEL,
-    ) -> None:
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+    ) -> Any:
+        ...
 
+
+# ============================================================
+# Groq-backed provider
+# ============================================================
+
+class GroqProvider:
+    """Concrete provider that uses the Groq API.
+
+    This encapsulates all Groq-specific details so higher-level code
+    can depend on the LLMProvider Protocol instead.
+    """
+
+    def __init__(self, model: str = DEFAULT_MODEL) -> None:
         api_key = os.environ.get("GROQ_API_KEY")
 
         if not api_key:
@@ -40,15 +55,8 @@ class LLMClient:
                 "Make sure it is set in your .env file."
             )
 
-        self.client = Groq(
-            api_key=api_key
-        )
-
+        self.client = Groq(api_key=api_key)
         self.model = model
-
-    # ========================================================
-    # CHAT
-    # ========================================================
 
     def chat(
         self,
@@ -56,6 +64,52 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
     ) -> Any:
+
+        kwargs: dict[str, Any] = {"model": self.model, "messages": messages}
+
+        if tools is not None:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto" if tool_choice is None else tool_choice
+
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            raise RuntimeError(f"Groq API call failed: {e}") from e
+
+        return response.choices[0].message
+
+
+# ============================================================
+# Backwards-compatible LLMClient wrapper
+# ============================================================
+
+class LLMClient:
+    """Compatibility wrapper that preserves the original LLMClient API.
+
+    It delegates to an underlying provider (currently GroqProvider) so
+    existing imports and tests that reference agent.llm.LLMClient continue
+    to work unchanged.
+    """
+
+    def __init__(self, model: str = DEFAULT_MODEL) -> None:
+        # Internally use the GroqProvider by default
+        self._provider: LLMProvider = GroqProvider(model=model)
+        # Backwards-compatible public attributes expected by callers/tests
+        # - model: the selected model name
+        # - client: the underlying provider client (if available)
+        self.model = model
+        try:
+            self.client = self._provider.client
+        except Exception:
+            self.client = None
+
+    def chat(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+    ) -> Any:
+        return self._provider.chat(messages, tools=tools, tool_choice=tool_choice)
         """
         Send messages to the Groq LLM.
 
