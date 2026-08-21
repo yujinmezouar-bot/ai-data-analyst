@@ -1,19 +1,22 @@
 import json
+from collections import OrderedDict
 from typing import Any
 
 import pandas as pd
 
 from agent.llm import LLMClient
 
-from tools.dataset_info import dataset_info, DATASET_INFO_SCHEMA, format_dataset_context
+from tools.dataset_info import dataset_info, DATASET_INFO_SCHEMA, format_dataset_context, format_datasets_context
 from tools.missing_values import missing_values, MISSING_VALUES_SCHEMA
 from tools.statistics import statistics, STATISTICS_SCHEMA
 from tools.groupby import groupby_analysis, GROUPBY_ANALYSIS_SCHEMA
-from tools.visualization import create_visualization, CREATE_VISUALIZATION_SCHEMA
+from tools.visualization import create_visualization, CREATE_VISUALIZATION_SCHEMA, create_multi_dataset_visualization, MULTI_DATASET_VISUALIZATION_SCHEMA
 from tools.time_analysis import time_analysis, TIME_ANALYSIS_SCHEMA
 from tools.correlation import correlation_analysis, CORRELATION_ANALYSIS_SCHEMA
 from tools.outliers import outlier_analysis, OUTLIER_ANALYSIS_SCHEMA
 from tools.period_comparison import percentage_change, PERCENTAGE_CHANGE_SCHEMA
+from tools.join_datasets import inspect_join_viability, execute_join, INSPECT_JOIN_SCHEMA, EXECUTE_JOIN_SCHEMA
+from tools.relationship_discovery import discover_relationships as _discover_relationships_tool, build_schema_graph_summary, DISCOVER_RELATIONSHIPS_SCHEMA
 
 
 # ============================================================
@@ -30,6 +33,10 @@ TOOL_FUNCTIONS = {
     "correlation_analysis": correlation_analysis,
     "outlier_analysis": outlier_analysis,
     "percentage_change": percentage_change,
+    "inspect_join_viability": inspect_join_viability,
+    "execute_join": execute_join,
+    "discover_relationships": _discover_relationships_tool,
+    "create_multi_dataset_visualization": create_multi_dataset_visualization,
 }
 
 TOOL_SCHEMAS = [
@@ -42,6 +49,10 @@ TOOL_SCHEMAS = [
     CORRELATION_ANALYSIS_SCHEMA,
     OUTLIER_ANALYSIS_SCHEMA,
     PERCENTAGE_CHANGE_SCHEMA,
+    INSPECT_JOIN_SCHEMA,
+    EXECUTE_JOIN_SCHEMA,
+    DISCOVER_RELATIONSHIPS_SCHEMA,
+    MULTI_DATASET_VISUALIZATION_SCHEMA,
 ]
 
 # Required parameters per tool, derived from the schemas above, used only
@@ -528,21 +539,47 @@ class Agent:
     bookkeeping -- and is safe to log or display in a debug panel.
     """
 
+    _MAX_DERIVED_DATASETS = 3
+
     def __init__(self) -> None:
-        self.llm = LLMClient()
+        # Lazy-initialize LLMClient so tests can patch LLMClient after Agent instantiation.
+        self.llm = None
+        self.derived_datasets: OrderedDict[str, Any] = OrderedDict()
+        self._derived_count = 0
 
     def run(
         self,
         question: str,
-        df: pd.DataFrame,
+        df: pd.DataFrame = None,
         conversation_history: list[dict[str, str]] | None = None,
+        datasets: dict[str, pd.DataFrame] = None,
     ) -> dict[str, Any]:
 
         history = conversation_history or []
         if len(history) > MAX_HISTORY_MESSAGES:
             history = history[-MAX_HISTORY_MESSAGES:]
+        # Ensure llm is initialized lazily to allow tests to patch LLMClient before first use.
+        if self.llm is None:
+            self.llm = LLMClient()
 
-        dataset_context = format_dataset_context(df) if df is not None and not df.empty else ""
+        # Reset derived datasets at the start of each run
+        self.derived_datasets = OrderedDict()
+        self._derived_count = 0
+
+        # Normalize datasets
+        self.active_datasets = datasets or {}
+        if df is not None:
+            self.active_datasets["default"] = df
+
+        # Determine the primary dataset for backward compatibility with tools
+        self.primary_df = next(iter(self.active_datasets.values())) if self.active_datasets else None
+
+        dataset_context = format_datasets_context(self.active_datasets)
+        # V8: append compact schema relationship map when 2+ datasets are present
+        if len(self.active_datasets) >= 2:
+            schema_graph = build_schema_graph_summary(self.active_datasets)
+            if schema_graph:
+                dataset_context = (dataset_context + "\n\n" + schema_graph).strip()
         system_content = SYSTEM_PROMPT
         if dataset_context:
             system_content += f"\n\n{dataset_context}"
@@ -623,7 +660,7 @@ class Agent:
                         success = not (isinstance(tool_result, dict) and "error" in tool_result)
                         reused = True
                     else:
-                        tool_result = self._execute_tool(tool_name, tool_args, df)
+                        tool_result = self._execute_tool(tool_name, tool_args, self.primary_df)
                         success = not (isinstance(tool_result, dict) and "error" in tool_result)
                         reused = False
                         if isinstance(tool_result, dict):
@@ -731,8 +768,132 @@ class Agent:
                 "hint": "Please select from one of the available registered tools.",
             }
 
+        # ------------------------------------------------------------------
+        # V8: RELATIONSHIP DISCOVERY INTERCEPT (read-only, multi-dataset)
+        # discover_relationships receives all available datasets as a dict.
+        # ------------------------------------------------------------------
+        if tool_name == "discover_relationships":
+            all_available = dict(getattr(self, "active_datasets", {}))
+            all_available.update(getattr(self, "derived_datasets", {}))
+            target_ds = tool_args.pop("dataset_name", None)
+            min_conf = tool_args.pop("min_confidence", 0.4)
+            try:
+                return _discover_relationships_tool(
+                    all_available,
+                    target_dataset=target_ds,
+                    min_confidence=float(min_conf) if min_conf is not None else 0.4,
+                )
+            except Exception as e:
+                return {"error": f"Tool 'discover_relationships' failed: {e}"}
+
+        # ------------------------------------------------------------------
+        # V8: MULTI-DATASET VISUALIZATION INTERCEPT
+        # create_multi_dataset_visualization receives the full datasets dict.
+        # ------------------------------------------------------------------
+        if tool_name == "create_multi_dataset_visualization":
+            all_available = dict(getattr(self, "active_datasets", {}))
+            all_available.update(getattr(self, "derived_datasets", {}))
+            try:
+                result = create_multi_dataset_visualization(
+                    datasets=all_available,
+                    **tool_args,
+                )
+            except TypeError as e:
+                return {
+                    "error": f"Tool 'create_multi_dataset_visualization' was called with invalid or missing arguments: {e}",
+                    "hint": "Provide a 'series' list with dataset_name, x_column, and y_column for each trace.",
+                }
+            except Exception as e:
+                return {"error": f"Tool 'create_multi_dataset_visualization' failed: {e}"}
+            return result
+
+        # ------------------------------------------------------------------
+        # JOIN TOOL INTERCEPT (V7)
+        # inspect_join_viability and execute_join require two named datasets
+        # (left_dataset, right_dataset) resolved from active or derived stores.
+        # ------------------------------------------------------------------
+        if tool_name in ("inspect_join_viability", "execute_join"):
+            left_name = tool_args.pop("left_dataset", None)
+            right_name = tool_args.pop("right_dataset", None)
+
+            all_available = dict(getattr(self, "active_datasets", {}))
+            all_available.update(getattr(self, "derived_datasets", {}))
+
+            if not left_name or left_name not in all_available:
+                return {
+                    "error": f"Left dataset '{left_name}' not found.",
+                    "available_datasets": list(all_available.keys()),
+                    "hint": "Provide a valid left_dataset name.",
+                }
+            if not right_name or right_name not in all_available:
+                return {
+                    "error": f"Right dataset '{right_name}' not found.",
+                    "available_datasets": list(all_available.keys()),
+                    "hint": "Provide a valid right_dataset name.",
+                }
+
+            left_df = all_available[left_name]
+            right_df = all_available[right_name]
+
+            try:
+                result = tool_function(left_df, right_df, **tool_args)
+            except TypeError as e:
+                required = _REQUIRED_PARAMS.get(tool_name, [])
+                return {
+                    "error": f"Tool '{tool_name}' was called with invalid or missing arguments: {e}",
+                    "required_parameters": required,
+                    "hint": "Retry with all required parameters present and correctly named.",
+                }
+            except Exception as e:
+                return {"error": f"Tool '{tool_name}' failed: {e}"}
+
+            # Intercept raw DataFrame from successful execute_join
+            if tool_name == "execute_join" and isinstance(result, dict) and result.get("status") == "success":
+                joined_df = result.pop("dataframe")
+
+                self._derived_count = getattr(self, "_derived_count", 0) + 1
+                derived_name = f"derived_join_{self._derived_count}"
+
+                while len(self.derived_datasets) >= self._MAX_DERIVED_DATASETS:
+                    self.derived_datasets.popitem(last=False)
+
+                self.derived_datasets[derived_name] = joined_df
+
+                return {
+                    "status": "success",
+                    "dataset_name": derived_name,
+                    "shape": result.get("shape"),
+                    "columns": result.get("columns"),
+                    "cardinality": result.get("cardinality"),
+                    "hint": f"Joined dataset registered as '{derived_name}'. Pass dataset_name='{derived_name}' to any analytical tool to query it.",
+                }
+
+            return result
+
+        # ------------------------------------------------------------------
+        # STANDARD SINGLE-DATASET ROUTING (V6)
+        # ------------------------------------------------------------------
+        dataset_name = tool_args.pop("dataset_name", None)
+        target_df = df
+
+        if dataset_name:
+            # Handle explicit null or empty string gracefully
+            active = getattr(self, "active_datasets", {})
+            derived = getattr(self, "derived_datasets", {})
+            if dataset_name in active:
+                target_df = active[dataset_name]
+            elif dataset_name in derived:
+                target_df = derived[dataset_name]
+            else:
+                available = list(active.keys()) + list(derived.keys()) if (active or derived) else ["default"]
+                return {
+                    "error": f"Dataset '{dataset_name}' not found.",
+                    "available_datasets": available,
+                    "hint": "Check the spelling of the dataset_name or leave it empty to use the primary dataset."
+                }
+
         try:
-            return tool_function(df, **tool_args)
+            return tool_function(target_df, **tool_args)
         except TypeError as e:
             # Distinguish "wrong/missing arguments" from a genuine internal
             # failure, and point the model at exactly what it needs to fix.

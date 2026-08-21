@@ -198,6 +198,7 @@ CREATE_VISUALIZATION_SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
+                "dataset_name": {"type": "string", "description": "The name of the dataset to analyze (e.g. 'sales.csv'). Optional. Defaults to the primary dataset."},
                 "chart_type": {
                     "type": "string",
                     "enum": sorted(ALLOWED_CHART_TYPES),
@@ -240,3 +241,160 @@ CREATE_VISUALIZATION_SCHEMA = {
         },
     },
 }
+
+
+MULTI_DATASET_VISUALIZATION_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "create_multi_dataset_visualization",
+        "description": (
+            "Create a multi-series comparison chart (bar or line) combining data across multiple datasets "
+            "on a common x-axis without requiring an explicit dataset join."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "chart_type": {
+                    "type": "string",
+                    "enum": ["line", "bar"],
+                    "description": "Type of multi-dataset chart: 'line' or 'bar'. Defaults to 'line'.",
+                },
+                "series": {
+                    "type": "array",
+                    "description": "List of series configurations to plot on the same figure.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "dataset_name": {
+                                "type": "string",
+                                "description": "The dataset containing this series.",
+                            },
+                            "x_column": {
+                                "type": "string",
+                                "description": "Column for x-axis.",
+                            },
+                            "y_column": {
+                                "type": "string",
+                                "description": "Numeric column for y-axis.",
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "Display label for this series (optional).",
+                            },
+                        },
+                        "required": ["dataset_name", "x_column", "y_column"],
+                    },
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Custom chart title (optional).",
+                },
+            },
+            "required": ["series"],
+        },
+    },
+}
+
+
+def create_multi_dataset_visualization(
+    datasets: dict[str, pd.DataFrame],
+    series: list[dict[str, Any]],
+    chart_type: str = "line",
+    title: str | None = None,
+) -> dict[str, Any]:
+    """
+    Generate a Plotly multi-series visualization comparing traces from different datasets.
+    """
+    if not datasets:
+        return {"error": "No datasets available for multi-dataset visualization."}
+
+    if chart_type not in ["line", "bar"]:
+        return {"error": f"Chart type '{chart_type}' is not supported for multi-dataset visualization. Choose 'line' or 'bar'."}
+
+    if not series or not isinstance(series, list) or len(series) == 0:
+        return {"error": "At least one series specification is required in 'series'."}
+
+    fig = go.Figure()
+    traces_added = 0
+
+    for idx, s_spec in enumerate(series):
+        ds_name = s_spec.get("dataset_name")
+        x_col = s_spec.get("x_column")
+        y_col = s_spec.get("y_column")
+        trace_label = s_spec.get("name") or f"{ds_name}: {y_col}"
+
+        if not ds_name or ds_name not in datasets:
+            return {
+                "error": f"Dataset '{ds_name}' specified in series not found.",
+                "available_datasets": list(datasets.keys()),
+            }
+
+        df = datasets[ds_name]
+
+        if x_col not in df.columns:
+            return {
+                "error": f"Column '{x_col}' not found in dataset '{ds_name}'.",
+                "available_columns": list(df.columns),
+            }
+
+        if y_col not in df.columns:
+            return {
+                "error": f"Column '{y_col}' not found in dataset '{ds_name}'.",
+                "available_columns": list(df.columns),
+            }
+
+        if not pd.api.types.is_numeric_dtype(df[y_col]):
+            return {"error": f"Column '{y_col}' in dataset '{ds_name}' is not numeric."}
+
+        # Robustly extract x and y series and drop rows with NaNs in either
+        try:
+            s_x = df[x_col]
+            s_y = df[y_col]
+        except Exception:
+            # Column existence was already checked above, but guard defensively
+            return {"error": f"Failed to access columns '{x_col}' or '{y_col}' in dataset '{ds_name}'."}
+
+        # When columns have identical names (x_col == y_col) or duplicated labels,
+        # ensure we operate on Series objects and align masks by index.
+        if isinstance(s_x, pd.DataFrame):
+            # multiple columns with same label -> take first
+            s_x = s_x.iloc[:, 0]
+        if isinstance(s_y, pd.DataFrame):
+            s_y = s_y.iloc[:, 0]
+
+        mask = s_x.notna() & s_y.notna()
+        x_vals = s_x.loc[mask].tolist()
+        y_vals = s_y.loc[mask].tolist()
+
+        if not x_vals or not y_vals:
+            return {"error": f"No data available after dropping nulls for series in dataset '{ds_name}'."}
+
+        if chart_type == "bar":
+            fig.add_trace(go.Bar(
+                x=x_vals,
+                y=y_vals,
+                name=trace_label,
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=x_vals,
+                y=y_vals,
+                mode="lines+markers",
+                name=trace_label,
+            ))
+        traces_added += 1
+
+    chart_title = title or f"Cross-Dataset Comparison ({chart_type.capitalize()})"
+    fig.update_layout(
+        title=chart_title,
+        template="plotly_white",
+        legend_title="Series",
+    )
+
+    return {
+        "status": "success",
+        "chart_type": chart_type,
+        "traces_count": traces_added,
+        "title": chart_title,
+        "figure": fig,
+    }
