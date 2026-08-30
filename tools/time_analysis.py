@@ -191,7 +191,7 @@ TIME_ANALYSIS_SCHEMA = {
         ),
         "parameters": {
             "type": "object",
-            "properties": {
+            "properties": { "dataset_name": {"type": "string", "description": "The name of the dataset to analyze (e.g. 'sales.csv'). Optional. Defaults to the primary dataset."},
                 "date_column": {"type": "string", "description": "The datetime column to bucket by, e.g. 'Date'."},
                 "value_column": {"type": "string", "description": "The numeric column to aggregate, e.g. 'Weekly_Sales'."},
                 "period": {"type": "string", "enum": sorted(ALLOWED_PERIODS), "description": "Time bucket size. Defaults to 'month'."},

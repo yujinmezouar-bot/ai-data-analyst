@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 
 from agent.agent import Agent, MAX_HISTORY_MESSAGES
+from reports.report_builder import build_analysis_report, render_markdown
 from ui_utils import dataset_signature, load_dataset, user_error_message
 
 
@@ -18,6 +19,9 @@ st.write("Upload a dataset and ask questions about it in plain English.")
 if "df" not in st.session_state:
     st.session_state.df = None
 
+if "datasets" not in st.session_state:
+    st.session_state.datasets = {}
+
 if "agent" not in st.session_state:
     st.session_state.agent = None
 
@@ -29,6 +33,15 @@ if "last_figure" not in st.session_state:
 
 if "detected_dates" not in st.session_state:
     st.session_state.detected_dates = {}
+
+if "last_analysis_result" not in st.session_state:
+    st.session_state.last_analysis_result = None
+
+if "last_question" not in st.session_state:
+    st.session_state.last_question = None
+
+if "last_report_markdown" not in st.session_state:
+    st.session_state.last_report_markdown = None
 
 
 # ============================================================
@@ -45,23 +58,36 @@ def get_agent() -> Agent:
 # FILE UPLOAD
 # ============================================================
 
-uploaded_file = st.file_uploader("Upload your dataset", type=["csv", "xlsx", "xls"])
+uploaded_files = st.file_uploader("Upload your dataset(s)", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
 
-if uploaded_file is not None:
+if uploaded_files:
     try:
-        upload_signature = dataset_signature(uploaded_file)
+        # Build signature from all files to detect changes
+        upload_signature = tuple(dataset_signature(f) for f in uploaded_files)
         if (
             "uploaded_signature" not in st.session_state
             or st.session_state.uploaded_signature != upload_signature
         ):
-            st.session_state.df, st.session_state.detected_dates = load_dataset(uploaded_file)
+            st.session_state.datasets = {}
+            st.session_state.detected_dates = {}
+            for f in uploaded_files:
+                df, dates = load_dataset(f)
+                st.session_state.datasets[f.name] = df
+                st.session_state.detected_dates.update(dates)
+
+            # Set primary df for backward compatible UI preview
+            st.session_state.df = next(iter(st.session_state.datasets.values())) if st.session_state.datasets else None
             st.session_state.uploaded_signature = upload_signature
 
             # New dataset = new conversation.
             st.session_state.messages = []
             st.session_state.last_figure = None
+            st.session_state.last_analysis_result = None
+            st.session_state.last_question = None
+            st.session_state.last_report_markdown = None
 
-        st.success(f"Loaded '{uploaded_file.name}' successfully.")
+        names = ", ".join(st.session_state.datasets.keys())
+        st.success(f"Loaded successfully: {names}")
 
         if st.session_state.detected_dates:
             date_summary = ", ".join(
@@ -73,7 +99,11 @@ if uploaded_file is not None:
     except Exception as e:
         st.error(user_error_message(e, action="upload") if not isinstance(e, ValueError) else str(e))
         st.session_state.df = None
+        st.session_state.datasets = {}
         st.session_state.last_figure = None
+        st.session_state.last_analysis_result = None
+        st.session_state.last_question = None
+        st.session_state.last_report_markdown = None
 
 
 # ============================================================
@@ -115,6 +145,9 @@ if df is not None:
         if st.button("Clear conversation"):
             st.session_state.messages = []
             st.session_state.last_figure = None
+            st.session_state.last_analysis_result = None
+            st.session_state.last_question = None
+            st.session_state.last_report_markdown = None
             st.rerun()
 
     for msg in st.session_state.messages:
@@ -140,12 +173,17 @@ if df is not None:
         else:
             try:
                 st.session_state.last_figure = None
+                st.session_state.last_analysis_result = None
+                st.session_state.last_question = None
+                st.session_state.last_report_markdown = None
                 with st.spinner("Analyzing your dataset, running tools if needed, and generating the final answer..."):
                     agent = get_agent()
                     result = agent.run(
                         question,
-                        df,
+                        df=None,
                         conversation_history=st.session_state.messages,
+                        datasets=st.session_state.datasets,
+                        autonomous=None,
                     )
 
                 st.session_state.messages.append({"role": "user", "content": question})
@@ -155,16 +193,40 @@ if df is not None:
                     st.session_state.messages = st.session_state.messages[-MAX_HISTORY_MESSAGES:]
 
                 st.session_state.last_figure = result["figure"]
+                st.session_state.last_analysis_result = result
+                st.session_state.last_question = question
 
                 st.rerun()
 
             except Exception as e:
                 st.session_state.last_figure = None
+                st.session_state.last_analysis_result = None
+                st.session_state.last_question = None
+                st.session_state.last_report_markdown = None
                 st.error(user_error_message(e))
 
     if st.session_state.last_figure is not None:
         st.subheader("Visualization")
         st.plotly_chart(st.session_state.last_figure, use_container_width=True)
+
+    if st.session_state.last_analysis_result is not None:
+        st.subheader("Analysis Report")
+        if st.button("Generate Report"):
+            report = build_analysis_report(
+                st.session_state.last_question or "Analysis",
+                st.session_state.last_analysis_result,
+                st.session_state.datasets,
+            )
+            st.session_state.last_report_markdown = render_markdown(report)
+
+        if st.session_state.last_report_markdown:
+            st.markdown(st.session_state.last_report_markdown)
+            st.download_button(
+                "Download Markdown Report",
+                data=st.session_state.last_report_markdown,
+                file_name="ai_data_analysis_report.md",
+                mime="text/markdown",
+            )
 
 else:
     st.info("Upload a CSV or Excel file to get started.")

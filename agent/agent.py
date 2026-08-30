@@ -1,10 +1,14 @@
 import json
+import re
 from collections import OrderedDict
 from typing import Any
 
 import pandas as pd
 
 from agent.llm import LLMClient
+from autonomous.executor import Executor
+from autonomous.plan import AnalysisPlan
+from autonomous.planner import AdaptiveReviewError, AnalysisPlanner, PlannerError
 
 from tools.dataset_info import dataset_info, DATASET_INFO_SCHEMA, format_dataset_context, format_datasets_context
 from tools.missing_values import missing_values, MISSING_VALUES_SCHEMA
@@ -17,6 +21,8 @@ from tools.outliers import outlier_analysis, OUTLIER_ANALYSIS_SCHEMA
 from tools.period_comparison import percentage_change, PERCENTAGE_CHANGE_SCHEMA
 from tools.join_datasets import inspect_join_viability, execute_join, INSPECT_JOIN_SCHEMA, EXECUTE_JOIN_SCHEMA
 from tools.relationship_discovery import discover_relationships as _discover_relationships_tool, build_schema_graph_summary, DISCOVER_RELATIONSHIPS_SCHEMA
+from tools.contribution_analysis import kpi_contribution_analysis, KPI_CONTRIBUTION_SCHEMA
+from tools.ml_model import train_ml_model, TRAIN_ML_MODEL_SCHEMA
 
 
 # ============================================================
@@ -37,6 +43,8 @@ TOOL_FUNCTIONS = {
     "execute_join": execute_join,
     "discover_relationships": _discover_relationships_tool,
     "create_multi_dataset_visualization": create_multi_dataset_visualization,
+    "kpi_contribution_analysis": kpi_contribution_analysis,
+    "train_ml_model": train_ml_model,
 }
 
 TOOL_SCHEMAS = [
@@ -53,6 +61,8 @@ TOOL_SCHEMAS = [
     EXECUTE_JOIN_SCHEMA,
     DISCOVER_RELATIONSHIPS_SCHEMA,
     MULTI_DATASET_VISUALIZATION_SCHEMA,
+    KPI_CONTRIBUTION_SCHEMA,
+    TRAIN_ML_MODEL_SCHEMA,
 ]
 
 # Required parameters per tool, derived from the schemas above, used only
@@ -80,22 +90,47 @@ MAX_TOOL_ITERATIONS = 4
 # it gets truncated before being sent to either LLM call.
 MAX_TOOL_RESULT_CHARS = 4000
 MAX_TRUNCATED_ENTRIES = 25
+MAX_RETURNED_EVIDENCE = 20
 # Conservative character budget (~6k tokens) for a model environment with an
 # 8k TPM limit. Tool schemas are included because providers count them too.
 MAX_LLM_REQUEST_CHARS = 24000
+
+CONTRIBUTION_CHANGE_EXECUTION_PLAN = (
+    "Decompose the observed KPI change into ranked group contributions and offsets."
+)
 
 
 def _build_execution_plan(question: str) -> str | None:
     """Return a concise, user-safe plan only for clearly multi-step requests."""
     text = question.lower()
     time_terms = ("trend", "over time", "monthly", "weekly", "quarter", "yearly")
-    ranking_terms = ("top ", "bottom ", "best", "worst", "highest", "lowest")
+    ranking_terms = (
+        "top ", "bottom ", "best", "worst", "highest", "lowest",
+        "most", "least", "biggest", "largest", "smallest",
+    )
+    change_terms = (
+        "change", "grew", "growth", "declined", "decline", "increased", "increase",
+        "decreased", "decrease", "dropped", "drop", "rose", "rise",
+    )
+    contribution_terms = (
+        "drove", "drive", "driver", "contribute", "contributed", "contribution",
+        "offset", "offsetting", "account for", "accounted for",
+    )
+    simple_relative_period_comparison = re.search(
+        r"\bcompare\s+(?:this|current|latest)\s+(year|quarter|month|week|period)\s+"
+        r"(?:with|to|versus|vs\.?)\s+(?:the\s+)?previous\s+\1\b",
+        text,
+    )
 
-    if "why" in text and any(term in text for term in ("change", "increase", "decrease", "grew", "decline")):
+    if any(term in text for term in contribution_terms) and any(term in text for term in change_terms):
+        return CONTRIBUTION_CHANGE_EXECUTION_PLAN
+    if "why" in text and any(term in text for term in change_terms):
         return "Identify the observed change, then examine relevant groups for associated contributors."
     if any(term in text for term in time_terms) and any(term in text for term in ranking_terms):
         return "Rank the requested entities, then analyze the selected entities over time."
-    if any(term in text for term in ("compare", "relationship", "correlation")) and any(
+    if not simple_relative_period_comparison and any(
+        term in text for term in ("compare", "relationship", "correlation")
+    ) and any(
         term in text for term in time_terms
     ):
         return "Run the requested analyses in sequence and combine the relevant results."
@@ -124,7 +159,45 @@ def _compact_messages_for_request(
                 break
 
     selected = set(required)
+    context_indexes = [index for index in range(1, len(messages) - 1) if index not in required]
+    if context_indexes:
+        newest_index = context_indexes[-1]
+        newest = dict(messages[newest_index])
+        complete_candidate = [
+            message for index, message in enumerate(messages)
+            if index in selected | {newest_index}
+        ]
+        if _estimate_request_chars(complete_candidate, tools) <= MAX_LLM_REQUEST_CHARS:
+            selected.add(newest_index)
+        else:
+            # The tool schema can leave less room than one history message.
+            # Reserve a bounded prefix of the newest item before considering
+            # older context so follow-up references are not lost entirely.
+            content = str(newest.get("content", ""))
+            low, high = 0, len(content)
+            while low < high:
+                midpoint = (low + high + 1) // 2
+                newest["content"] = content[:midpoint] + "\n[Context compacted for request size.]"
+                candidate = [
+                    newest if index == newest_index else message
+                    for index, message in enumerate(messages)
+                    if index in selected | {newest_index}
+                ]
+                if _estimate_request_chars(candidate, tools) <= MAX_LLM_REQUEST_CHARS:
+                    low = midpoint
+                else:
+                    high = midpoint - 1
+            if low:
+                messages = list(messages)
+                messages[newest_index] = {
+                    **newest,
+                    "content": content[:low] + "\n[Context compacted for request size.]",
+                }
+                selected.add(newest_index)
+
     for index in range(len(messages) - 2, 0, -1):
+        if index in selected:
+            continue
         candidate = [message for i, message in enumerate(messages) if i in selected | {index}]
         if _estimate_request_chars(candidate, tools) <= MAX_LLM_REQUEST_CHARS:
             selected.add(index)
@@ -141,10 +214,17 @@ def _compact_messages_for_request(
     if _estimate_request_chars(compacted, tools) > MAX_LLM_REQUEST_CHARS:
         last = compacted[-1]
         content = str(last.get("content", ""))
-        allowance = max(500, MAX_LLM_REQUEST_CHARS - _estimate_request_chars(compacted[:-1], tools) - 200)
-        last = dict(last)
-        last["content"] = content[:allowance] + "\n[Context compacted for request size.]"
-        compacted[-1] = last
+        suffix = "\n[Context compacted for request size.]"
+        low, high = 0, len(content)
+        while low < high:
+            midpoint = (low + high + 1) // 2
+            candidate_last = {**last, "content": content[:midpoint] + suffix}
+            candidate = [*compacted[:-1], candidate_last]
+            if _estimate_request_chars(candidate, tools) <= MAX_LLM_REQUEST_CHARS:
+                low = midpoint
+            else:
+                high = midpoint - 1
+        compacted[-1] = {**last, "content": content[:low] + suffix}
     return compacted
 
 
@@ -190,6 +270,29 @@ def _compact_tool_result(result: Any) -> Any:
     return {
         "note": "Tool result was too large and has been truncated.",
         "truncated_preview": serialized[:MAX_TOOL_RESULT_CHARS],
+    }
+
+
+def _compact_ml_result_for_llm(result: Any) -> Any:
+    """Bound ML prompt content without degrading retained structured evidence."""
+    if not isinstance(result, dict) or "error" in result:
+        return result
+    return {
+        "task_type": result.get("task_type"),
+        "target_column": result.get("target_column"),
+        "rows_received": result.get("rows_received"),
+        "rows_used": result.get("rows_used"),
+        "rows_dropped": result.get("rows_dropped"),
+        "features_used": list(result.get("features_used") or [])[:20],
+        "features_excluded": list(result.get("features_excluded") or [])[:20],
+        "split": result.get("split"),
+        "target_summary": result.get("target_summary"),
+        "models": list(result.get("models") or [])[:2],
+        "best_model": result.get("best_model"),
+        "selection_metric": result.get("selection_metric"),
+        "feature_associations": list(result.get("feature_associations") or [])[:5],
+        "warnings": [str(value)[:300] for value in (result.get("warnings") or [])[:8]],
+        "limitations": [str(value)[:300] for value in (result.get("limitations") or [])[:5]],
     }
 
 
@@ -399,6 +502,57 @@ def _summarise_tool_results(
                     )
                     hints.append(f"[outlier_analysis] Columns with outliers: {summary}")
 
+        elif tool == "kpi_contribution_analysis":
+            overall = res.get("overall", {})
+            if isinstance(overall, dict):
+                pct = overall.get("percentage_change")
+                pct_text = f", {pct}%" if pct is not None else ""
+                hints.append(
+                    "[kpi_contribution_analysis] Observed total KPI "
+                    f"{overall.get('direction')}: {overall.get('value_a')} to {overall.get('value_b')} "
+                    f"(change {overall.get('absolute_change')}{pct_text})."
+                )
+            contributors = res.get("contributors")
+            if isinstance(contributors, list):
+                drivers = [item for item in contributors if str(item.get("effect", "")).startswith("reinforces_")]
+                offsets = [item for item in contributors if str(item.get("effect", "")).startswith("offsets_")]
+                if drivers:
+                    driver = drivers[0]
+                    hints.append(
+                        "[kpi_contribution_analysis] Largest returned mathematical driver: "
+                        f"{driver.get('group')} ({driver.get('absolute_change')}; "
+                        f"{driver.get('contribution_to_total_change_percentage')}% of net change)."
+                    )
+                if offsets:
+                    offset = min(
+                        offsets,
+                        key=lambda item: item.get("contribution_to_total_change_percentage") or 0,
+                    )
+                    hints.append(
+                        "[kpi_contribution_analysis] Largest returned offset: "
+                        f"{offset.get('group')} ({offset.get('absolute_change')})."
+                    )
+
+        elif tool == "train_ml_model":
+            models = res.get("models") if isinstance(res.get("models"), list) else []
+            hints.append(
+                f"[train_ml_model] {res.get('task_type')} target '{res.get('target_column')}', "
+                f"{res.get('rows_used')} usable rows; selected model: {res.get('best_model')}."
+            )
+            split = res.get("split") if isinstance(res.get("split"), dict) else {}
+            if split.get("group_aware"):
+                hints.append(
+                    f"[train_ml_model] Group-isolated evaluation by '{split.get('group_column')}': "
+                    f"{split.get('train_groups')} train groups, {split.get('test_groups')} test groups, "
+                    "zero group overlap."
+                )
+            for model in models:
+                if isinstance(model, dict):
+                    hints.append(
+                        f"[train_ml_model] {model.get('name')} test metrics: "
+                        f"{json.dumps(model.get('metrics', {}), default=str)}"
+                    )
+
         filter_applied = res.get("filter_applied")
         if isinstance(filter_applied, dict):
             column = filter_applied.get("column")
@@ -434,6 +588,90 @@ def _summarise_tool_results(
     return "\n\n".join(lines)
 
 
+def _compact_autonomous_findings(findings: list[Any]) -> list[dict[str, Any]]:
+    """Convert structured findings into bounded final-explanation evidence."""
+    compact: list[dict[str, Any]] = []
+    for finding in findings:
+        compact_result = _compact_tool_result(finding.result)
+        serialized_result = json.dumps(compact_result, default=str)
+        if len(serialized_result) > MAX_TOOL_RESULT_CHARS:
+            compact_result = {
+                "note": "Result truncated to keep the final explanation compact.",
+                "truncated_preview": serialized_result[:MAX_TOOL_RESULT_CHARS - 200],
+            }
+        compact.append({
+            "tool_name": finding.tool_name,
+            "datasets": list(finding.datasets),
+            "result": compact_result,
+            "provenance": _compact_tool_result(finding.provenance),
+        })
+    return compact
+
+
+def _autonomous_fallback_answer(compact_findings: list[dict[str, Any]]) -> str:
+    """Return a bounded deterministic answer when final synthesis is unavailable."""
+    if not compact_findings:
+        return "The autonomous analysis completed, but no findings were produced."
+
+    summary = _summarise_tool_results(
+        [{"tool_name": item["tool_name"], "result": item["result"]} for item in compact_findings],
+        has_figure=False,
+    )
+    if summary:
+        return summary
+
+    previews = []
+    for item in compact_findings[:3]:
+        result_text = json.dumps(item["result"], default=str)
+        previews.append(
+            f"{item['tool_name']} on {', '.join(item['datasets'])}: {result_text[:500]}"
+        )
+    return "Autonomous analysis completed. " + "\n".join(previews)
+
+
+MAX_AUTONOMOUS_DIAGNOSTIC_MESSAGE_CHARS = 500
+
+
+def _sanitize_autonomous_diagnostic_text(value: Any) -> str:
+    """Return bounded exception text without common credential representations."""
+    text = " ".join(str(value).split())
+    text = re.sub(
+        r"(?i)\b(api[_-]?key|authorization|password|secret|token)\b\s*[:=]\s*[^\s,;]+",
+        r"\1=[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [redacted]", text)
+    return text[:MAX_AUTONOMOUS_DIAGNOSTIC_MESSAGE_CHARS]
+
+
+def _autonomous_plan_summary(plan: AnalysisPlan) -> dict[str, Any]:
+    """Summarize a validated plan without arguments or user/provider content."""
+    return {
+        "id": str(plan.id)[:100],
+        "datasets": [str(name)[:100] for name in plan.datasets[:20]],
+        "step_count": len(plan.steps),
+        "steps": [
+            {"id": str(step.id)[:100], "tool_name": str(step.tool_name)[:100]}
+            for step in plan.steps[:10]
+        ],
+    }
+
+
+def _planner_failure_stage(exc: Exception) -> tuple[str, bool, bool]:
+    """Classify the existing PlannerError contract without retaining raw output."""
+    message = str(exc)
+    if isinstance(exc, PlannerError):
+        if message.startswith("LLM provider failed:"):
+            return "planner_call", False, False
+        if message == "LLM provider returned no textual content":
+            return "planner_call", True, False
+        if message.startswith("LLM returned invalid JSON:"):
+            return "planner_parse", True, False
+        if message.startswith("Plan validation failed:") or message.startswith("Unknown tool referenced in plan:"):
+            return "plan_validation", True, True
+    return "planner_call", False, False
+
+
 # ============================================================
 # FINAL EXPLANATION SYSTEM PROMPT (V5.4)
 # ============================================================
@@ -458,6 +696,9 @@ GROUNDING RULES (mandatory):
 6. Do NOT claim that any analysis was performed if no tool result confirms it.
 7. When DATA SUFFICIENCY is provided, state whether the evidence is limited or insufficient; do not invent a numerical confidence score.
 8. When a filtered scope is provided, make clear that the finding applies to that subset rather than the entire dataset.
+9. KPI contribution results are mathematical decomposition, not causation. Say a group "accounted for" or "contributed to" the observed change; never say it caused the change.
+10. ML metrics are held-out test estimates, not external validation. Feature associations are predictive and non-causal. Never claim they caused the target.
+11. For ML, group_column controls evaluation isolation and is never a predictive feature. Grouped evaluation estimates performance on unseen groups; ordinary row splitting does not. Repeated entities can inflate row-level random-split metrics.
 
 INSIGHT EXTRACTION — when relevant, surface:
 • Comparisons: best/worst group, absolute difference, percentage change, percentage difference (they are NOT the same thing)
@@ -503,6 +744,10 @@ SYSTEM_PROMPT = (
     "For greetings or non-data questions answer directly. For data facts, use the minimum sufficient tool: "
     "rankings and category comparisons use groupby_analysis; descriptive distributions use statistics; missing-data checks use missing_values; "
     "trends use time_analysis; period-over-period comparisons use percentage_change; relationships use correlation_analysis; unusual values use outlier_analysis; "
+    "questions about which groups drove, contributed to, or accounted for a KPI increase/decrease use kpi_contribution_analysis; "
+    "supervised model training/evaluation uses train_ml_model only when the target and classification/regression task are explicit; "
+    "omit feature_columns for safe automatic selection and never fabricate a target or feature list; "
+    "for explicitly named unseen entities, use an unambiguous group_column; otherwise ask, never invent it; "
     "dataset structure uses dataset_info only when the compact dataset context is insufficient. "
     "and charts=create_visualization only when they materially help. Set aggregation (and date period) for aggregated charts. "
     "Use compact context and recent conversation to resolve columns and references. For multi-step work, pass exact returned "
@@ -547,12 +792,53 @@ class Agent:
         self.derived_datasets: OrderedDict[str, Any] = OrderedDict()
         self._derived_count = 0
 
+    def register_derived_dataset(self, df: pd.DataFrame, suggested_name: str | None = None) -> str:
+        """Register a derived dataset into the canonical agent store.
+
+        This is the single canonical place for derived-dataset naming, LRU
+        enforcement, and persistent storage. It mirrors the behavior used
+        internally when execute_join is invoked through the agent tool path.
+
+        The signature accepts the DataFrame and an optional suggested_name.
+        If suggested_name is already present, a counter-based name will be
+        assigned to avoid collisions.
+
+        Returns the derived dataset name assigned.
+        """
+        # Ensure counters exist and increment for deterministic naming
+        self._derived_count = getattr(self, "_derived_count", 0) + 1
+
+        if suggested_name:
+            derived_name = suggested_name
+            if derived_name in self.derived_datasets:
+                # Fall back to counter-based name to avoid clobbering
+                derived_name = f"derived_join_{self._derived_count}"
+        else:
+            derived_name = f"derived_join_{self._derived_count}"
+
+        # Evict oldest if at capacity
+        while len(self.derived_datasets) >= self._MAX_DERIVED_DATASETS:
+            self.derived_datasets.popitem(last=False)
+
+        # Store it canonically
+        self.derived_datasets[derived_name] = df
+        return derived_name
+
+    def derived_dataset_register(self, name: str, df: pd.DataFrame) -> str:
+        """Adapter matching Executor's expected signature: (name, df) -> str.
+
+        This delegates to register_derived_dataset and returns the canonical
+        derived name assigned (may differ if the suggested name collided).
+        """
+        return self.register_derived_dataset(df, suggested_name=name)
+
     def run(
         self,
         question: str,
         df: pd.DataFrame = None,
         conversation_history: list[dict[str, str]] | None = None,
         datasets: dict[str, pd.DataFrame] = None,
+        autonomous: bool | None = False,
     ) -> dict[str, Any]:
 
         history = conversation_history or []
@@ -574,6 +860,303 @@ class Agent:
         # Determine the primary dataset for backward compatibility with tools
         self.primary_df = next(iter(self.active_datasets.values())) if self.active_datasets else None
 
+        execution_plan_signal = _build_execution_plan(question)
+        routing_trace = None
+        attempt_autonomous = autonomous is True
+        if autonomous is None:
+            text = f" {question.lower()} "
+            visualization_terms = (" chart", " plot", " graph", "visualize", "visualise", "visualization", "visualisation")
+            context_references = (" those ", " them ", " their ", " these ", " it ", " that ", " they ", " above ")
+            without_temporal_previous = re.sub(
+                r"\bprevious\s+(?:year(?:'s)?|quarter|month|week|period)\b", "", text
+            )
+            has_context_reference = (
+                any(term in text for term in context_references)
+                or " previous " in without_temporal_previous
+            )
+
+            if any(term in text for term in visualization_terms):
+                routing_reason = "visualization_first_request"
+            elif has_context_reference:
+                routing_reason = "context_dependent_request"
+            elif not self.active_datasets:
+                routing_reason = "no_datasets"
+            elif execution_plan_signal is None:
+                routing_reason = "no_clear_multistep_signal"
+            else:
+                attempt_autonomous = True
+                routing_reason = (
+                    "contribution_change_signal"
+                    if execution_plan_signal == CONTRIBUTION_CHANGE_EXECUTION_PLAN
+                    else "clear_multistep_signal"
+                )
+
+            routing_trace = {
+                "step": "routing",
+                "mode": "auto",
+                "decision": "autonomous" if attempt_autonomous else "reactive",
+                "reason": routing_reason,
+            }
+
+        autonomous_fallback_trace = None
+        if attempt_autonomous and self.active_datasets:
+            autonomous_stage = "planner_call"
+            planner_output_received = False
+            planner_json_parsed = False
+            plan_validated = False
+            autonomous_plan = None
+            executor = None
+            try:
+                planner = AnalysisPlanner(
+                    self.llm,
+                    tools_registry=TOOL_FUNCTIONS,
+                    validate_tools=True,
+                )
+                autonomous_plan = planner.plan(
+                    question,
+                    context={
+                        "datasets": list(self.active_datasets.keys()),
+                        "dataset_context": format_datasets_context(self.active_datasets),
+                        "relationship_context": (
+                            build_schema_graph_summary(self.active_datasets)
+                            if len(self.active_datasets) >= 2 else ""
+                        ),
+                        "tool_schemas": TOOL_SCHEMAS,
+                    },
+                )
+                planner_output_received = True
+                planner_json_parsed = True
+                plan_validated = True
+                autonomous_stage = "plan_validation"
+                if not autonomous_plan.steps:
+                    raise ValueError("Autonomous plan contained no executable steps.")
+
+                executor = Executor(
+                    TOOL_FUNCTIONS,
+                    derived_dataset_register=self.derived_dataset_register,
+                    tool_schemas=TOOL_SCHEMAS,
+                )
+                autonomous_stage = "preflight"
+                findings_store = executor.execute(autonomous_plan, self.active_datasets)
+                autonomous_stage = "post_execution"
+                findings = findings_store.all()
+                adaptive_trace: list[dict[str, Any]] = []
+                adaptive_limitation = None
+                initial_compact_findings = _compact_autonomous_findings(findings)
+                review_messages = planner.build_review_prompt(
+                    question,
+                    initial_compact_findings,
+                    format_datasets_context(self.active_datasets, self.derived_datasets),
+                    TOOL_SCHEMAS,
+                )
+                review_messages = _compact_messages_for_request(
+                    review_messages, current_question=question
+                )
+
+                review = None
+                try:
+                    review_message = self.llm.chat(review_messages, tool_choice="none")
+                    review_content = getattr(review_message, "content", None)
+                    if not isinstance(review_content, str) or not review_content.strip():
+                        raise ValueError("Adaptive review returned no content.")
+                    review = planner.parse_review(review_content, max_follow_up_steps=2)
+                except Exception as exc:
+                    failure_status = "failed" if not isinstance(exc, ValueError) else "invalid"
+                    if exc.__class__.__name__ == "PlannerError":
+                        failure_status = "invalid"
+                    if isinstance(exc, AdaptiveReviewError):
+                        failure_status = "invalid"
+                    review_trace = {
+                        "step": "adaptive_review",
+                        "status": failure_status,
+                        "reason": "review_provider_failure" if failure_status == "failed" else "invalid_review_response",
+                        "proposed_steps": 0,
+                    }
+                    if failure_status == "invalid":
+                        failure_stage = (
+                            getattr(exc, "failure_stage", None)
+                            or ("empty_content" if isinstance(exc, ValueError) else "contract_validation")
+                        )
+                        review_trace.update({
+                            "failure_stage": failure_stage,
+                            "exception_type": f"{type(exc).__module__}.{type(exc).__name__}"[:200],
+                            "diagnostic_message": _sanitize_autonomous_diagnostic_text(exc),
+                        })
+                        parsed_metadata = getattr(exc, "parsed_metadata", {})
+                        if parsed_metadata:
+                            safe_keys = [
+                                _sanitize_autonomous_diagnostic_text(key)[:100]
+                                for key in parsed_metadata.get("top_level_keys", [])[:20]
+                            ]
+                            safe_types = {
+                                _sanitize_autonomous_diagnostic_text(key)[:100]: str(value)[:50]
+                                for key, value in list(parsed_metadata.get("top_level_types", {}).items())[:20]
+                            }
+                            review_trace["parsed_top_level_keys"] = safe_keys
+                            review_trace["parsed_top_level_types"] = safe_types
+                    adaptive_trace.extend([
+                        review_trace,
+                        {"step": "adaptive_stop", "reason": failure_status + "_review"},
+                    ])
+                    adaptive_limitation = "Adaptive review could not be completed; the answer uses the initial findings."
+
+                if review is not None:
+                    proposed_steps = len(review["steps"])
+                    adaptive_trace.append({
+                        "step": "adaptive_review",
+                        "status": review["status"],
+                        "reason": review["reason"],
+                        "proposed_steps": proposed_steps,
+                    })
+                    if review["status"] == "complete":
+                        adaptive_trace.append({"step": "adaptive_stop", "reason": "review_complete"})
+                    else:
+                        remaining_steps = max(0, 10 - len(autonomous_plan.steps))
+                        follow_up_steps = review["steps"]
+                        validation_reason = None
+                        if not remaining_steps or len(follow_up_steps) > remaining_steps:
+                            validation_reason = "global_step_limit"
+                        elif any(step["tool_name"] == "execute_join" for step in follow_up_steps):
+                            validation_reason = "follow_up_join_prohibited"
+                        elif any(step["tool_name"] == "train_ml_model" for step in follow_up_steps):
+                            validation_reason = "follow_up_ml_prohibited"
+                        elif any(not step["read_only"] for step in follow_up_steps):
+                            validation_reason = "follow_up_mutation_prohibited"
+
+                        adaptive_plan_id = f"adaptive_{autonomous_plan.id}"
+                        if validation_reason is None:
+                            available_datasets = {
+                                **self.active_datasets,
+                                **self.derived_datasets,
+                            }
+                            try:
+                                adaptive_plan = AnalysisPlan.from_dict(
+                                    {
+                                        "id": adaptive_plan_id,
+                                        "objective": review["reason"],
+                                        "datasets": list(available_datasets.keys()),
+                                        "steps": follow_up_steps,
+                                        "constraints": {
+                                            "parent_plan_id": autonomous_plan.id,
+                                            "adaptive_round": 1,
+                                            "reviewer_reason": review["reason"],
+                                        },
+                                    },
+                                    max_steps=remaining_steps,
+                                    allowed_datasets=list(available_datasets.keys()),
+                                )
+                                before_count = len(executor.findings_store)
+                                executor.execute(adaptive_plan, available_datasets)
+                                executed_steps = len(executor.findings_store) - before_count
+                                adaptive_trace.extend([
+                                    {
+                                        "step": "adaptive_execution",
+                                        "plan_id": adaptive_plan_id,
+                                        "executed_steps": executed_steps,
+                                        "status": "completed",
+                                    },
+                                    {"step": "adaptive_stop", "reason": "follow_up_complete"},
+                                ])
+                            except Exception:
+                                executed_steps = len(executor.findings_store) - before_count if "before_count" in locals() else 0
+                                adaptive_trace.extend([
+                                    {
+                                        "step": "adaptive_execution",
+                                        "plan_id": adaptive_plan_id,
+                                        "executed_steps": executed_steps,
+                                        "status": "failed",
+                                    },
+                                    {"step": "adaptive_stop", "reason": "follow_up_failed"},
+                                ])
+                                adaptive_limitation = "The adaptive follow-up could not be completed; available findings were preserved."
+                        else:
+                            adaptive_trace.extend([
+                                {
+                                    "step": "adaptive_execution",
+                                    "plan_id": adaptive_plan_id,
+                                    "executed_steps": 0,
+                                    "status": "failed",
+                                },
+                                {"step": "adaptive_stop", "reason": validation_reason},
+                            ])
+                            adaptive_limitation = "The proposed adaptive follow-up was not executed because it exceeded safety limits."
+
+                findings = executor.findings_store.all()
+                compact_findings = _compact_autonomous_findings(findings)
+                evidence = [
+                    {"tool_name": item["tool_name"], "result": item["result"]}
+                    for item in compact_findings
+                ]
+                analytical_summary = _summarise_tool_results(evidence, has_figure=False)
+                synthesis_parts = [
+                    f"User question:\n{question}",
+                    f"Completed autonomous plan:\n{json.dumps(autonomous_plan.to_dict(), default=str)}",
+                ]
+                if analytical_summary:
+                    synthesis_parts.append(analytical_summary)
+                if adaptive_limitation:
+                    synthesis_parts.append(adaptive_limitation)
+                synthesis_parts.append(
+                    "Structured findings (use these for exact values and provenance):\n"
+                    + json.dumps(compact_findings, default=str)
+                )
+                synthesis_parts.append("Now write the final answer to the user.")
+                synthesis_messages = _compact_messages_for_request([
+                    {"role": "system", "content": FINAL_EXPLANATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": "\n\n".join(synthesis_parts)},
+                ], current_question=question)
+
+                synthesis_succeeded = True
+                try:
+                    final_message = self.llm.chat(synthesis_messages, tool_choice="none")
+                    answer = final_message.content
+                    if not isinstance(answer, str) or not answer.strip():
+                        raise ValueError("Final synthesis returned no answer.")
+                except Exception:
+                    synthesis_succeeded = False
+                    answer = _autonomous_fallback_answer(compact_findings)
+
+                return {
+                    "answer": answer,
+                    "figure": None,
+                    "trace": [
+                        {"step": "question", "question": question},
+                        *([routing_trace] if routing_trace else []),
+                        {"step": "autonomous_plan", "plan": autonomous_plan.to_dict()},
+                        {"step": "autonomous_execution", "findings": len(initial_compact_findings)},
+                        *adaptive_trace,
+                        {"step": "autonomous_synthesis", "success": synthesis_succeeded},
+                        {"step": "final_answer", "tool_used": True, "autonomous": True},
+                    ],
+                    "findings": findings,
+                }
+            except Exception as exc:
+                # Autonomous execution is optional; the established reactive
+                # loop remains the fallback for invalid or unsupported plans.
+                if autonomous_stage == "planner_call":
+                    autonomous_stage, planner_output_received, planner_json_parsed = _planner_failure_stage(exc)
+                elif executor is not None and getattr(executor, "diagnostic_stage", None):
+                    autonomous_stage = executor.diagnostic_stage
+                failing_step_id = getattr(exc, "step_id", None)
+                if not failing_step_id and executor is not None and autonomous_stage == "execution":
+                    failing_step_id = getattr(executor, "diagnostic_step_id", None)
+                diagnostic_message = _sanitize_autonomous_diagnostic_text(exc)
+                autonomous_fallback_trace = {
+                    "step": "autonomous_fallback",
+                    "stage": autonomous_stage,
+                    "exception_type": f"{type(exc).__module__}.{type(exc).__name__}"[:200],
+                    "message": diagnostic_message,
+                    "planner_output_received": planner_output_received,
+                    "planner_json_parsed": planner_json_parsed,
+                    "plan_validated": plan_validated,
+                }
+                if plan_validated and autonomous_plan is not None:
+                    autonomous_fallback_trace["plan_summary"] = _autonomous_plan_summary(autonomous_plan)
+                if failing_step_id:
+                    autonomous_fallback_trace["failing_step_id"] = str(failing_step_id)[:100]
+                if autonomous_stage == "preflight":
+                    autonomous_fallback_trace["reason"] = diagnostic_message
+
         dataset_context = format_datasets_context(self.active_datasets)
         # V8: append compact schema relationship map when 2+ datasets are present
         if len(self.active_datasets) >= 2:
@@ -592,11 +1175,15 @@ class Agent:
 
         figure = None
         all_tool_results: list[dict[str, Any]] = []
+        all_evidence_results: list[dict[str, Any]] = []
         executed_calls_cache: dict[tuple[str, str], Any] = {}
         trace: list[dict[str, Any]] = [{"step": "question", "question": question}]
-        plan = _build_execution_plan(question)
-        if plan:
-            trace.append({"step": "plan", "summary": plan})
+        if routing_trace:
+            trace.append(routing_trace)
+        if autonomous_fallback_trace:
+            trace.append(autonomous_fallback_trace)
+        if execution_plan_signal:
+            trace.append({"step": "plan", "summary": execution_plan_signal})
         iterations = 0
 
         # ------------------------------------------------------------
@@ -614,10 +1201,16 @@ class Agent:
                 if iterations == 0:
                     # No tool was ever needed -- answer directly.
                     trace.append({"step": "final_answer", "tool_used": False})
-                    return {"answer": response_message.content, "figure": None, "trace": trace}
+                    return {
+                        "answer": response_message.content,
+                        "figure": None,
+                        "trace": trace,
+                        "evidence": [],
+                    }
                 break  # LLM is done requesting tools; go explain results.
 
             round_results = []
+            round_evidence_results = []
             for tool_call in tool_calls:
                 tool_name = tool_call.function.name
                 raw_arguments = tool_call.function.arguments
@@ -672,8 +1265,17 @@ class Agent:
                     figure = tool_result["figure"]
                     tool_result = {k: v for k, v in tool_result.items() if k != "figure"}
 
-                tool_result = _compact_tool_result(tool_result)
-                round_results.append({"tool_name": tool_name, "result": tool_result})
+                evidence_result = tool_result
+                llm_result = (
+                    _compact_ml_result_for_llm(tool_result)
+                    if tool_name == "train_ml_model" else tool_result
+                )
+                llm_result = _compact_tool_result(llm_result)
+                round_results.append({"tool_name": tool_name, "result": llm_result})
+                round_evidence_results.append({
+                    "tool_name": tool_name,
+                    "result": evidence_result if tool_name == "train_ml_model" else llm_result,
+                })
 
                 trace.append({
                     "step": "tool_call",
@@ -682,10 +1284,11 @@ class Agent:
                     "arguments": tool_args if not args_malformed else raw_arguments,
                     "success": success,
                     "reused": reused,
-                    "error": tool_result.get("error") if isinstance(tool_result, dict) else None,
+                    "error": llm_result.get("error") if isinstance(llm_result, dict) else None,
                 })
 
             all_tool_results.extend(round_results)
+            all_evidence_results.extend(round_evidence_results)
 
             # Feed results back as PLAIN TEXT only -- never role="tool",
             # never response_message.tool_calls persisted.
@@ -755,7 +1358,12 @@ class Agent:
 
         trace.append({"step": "final_answer", "tool_used": True, "iterations": iterations})
 
-        return {"answer": final_message.content, "figure": figure, "trace": trace}
+        return {
+            "answer": final_message.content,
+            "figure": figure,
+            "trace": trace,
+            "evidence": list(all_evidence_results[:MAX_RETURNED_EVIDENCE]),
+        }
 
     def _execute_tool(self, tool_name: str, tool_args: dict[str, Any], df: pd.DataFrame) -> Any:
         """Execute only tools explicitly registered in TOOL_FUNCTIONS."""
@@ -851,13 +1459,7 @@ class Agent:
             if tool_name == "execute_join" and isinstance(result, dict) and result.get("status") == "success":
                 joined_df = result.pop("dataframe")
 
-                self._derived_count = getattr(self, "_derived_count", 0) + 1
-                derived_name = f"derived_join_{self._derived_count}"
-
-                while len(self.derived_datasets) >= self._MAX_DERIVED_DATASETS:
-                    self.derived_datasets.popitem(last=False)
-
-                self.derived_datasets[derived_name] = joined_df
+                derived_name = self.register_derived_dataset(joined_df)
 
                 return {
                     "status": "success",

@@ -144,7 +144,7 @@ STATISTICS_SCHEMA = {
         ),
         "parameters": {
             "type": "object",
-            "properties": {
+            "properties": { "dataset_name": {"type": "string", "description": "The name of the dataset to analyze (e.g. 'sales.csv'). Optional. Defaults to the primary dataset."},
                 "column": {
                     "type": "string",
                     "description": (

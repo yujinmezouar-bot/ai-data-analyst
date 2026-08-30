@@ -5,6 +5,7 @@ env/
 
 __pycache__/
 *.pyc
+.pytest_cache/
 
 .streamlit/
 .DS_Store
@@ -12,4 +13,6 @@ Thumbs.db
 
 .vscode/
 .idea/
+
+evaluation/results/
 .venv/

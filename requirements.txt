@@ -2,7 +2,8 @@ streamlit==1.38.0
 pandas==2.2.2
 numpy==1.26.4
 plotly==5.24.0
-groq
+groq==1.6.0
 python-dotenv==1.0.1
 openpyxl==3.1.5
 pytest
+scikit-learn==1.7.2

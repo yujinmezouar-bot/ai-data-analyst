@@ -7,6 +7,7 @@ import plotly.graph_objects as go
 import pytest
 
 from agent.agent import (
+    CONTRIBUTION_CHANGE_EXECUTION_PLAN,
     FINAL_EXPLANATION_SYSTEM_PROMPT,
     MAX_HISTORY_MESSAGES,
     MAX_LLM_REQUEST_CHARS,
@@ -344,7 +345,7 @@ def test_agent_receives_dataset_context(sample_df: pd.DataFrame):
         # Inspect the system message passed to LLMClient.chat
         system_msg = mock_llm_instance.chat.call_args[0][0][0]
         assert system_msg["role"] == "system"
-        assert "[Active Dataset Context]" in system_msg["content"]
+        assert "[Dataset: " in system_msg["content"]
         assert "Weekly_Sales" in system_msg["content"]
         assert "Store" in system_msg["content"]
         assert "Date" in system_msg["content"]
@@ -621,6 +622,28 @@ def test_v56_complex_requests_receive_action_only_plan(sample_df: pd.DataFrame):
         "summary": "Rank the requested entities, then analyze the selected entities over time.",
     }
     assert "Weekly_Sales" not in result["trace"][1]["summary"]
+
+
+@pytest.mark.parametrize("question", [
+    "Which products drove the decline?",
+    "Which products drove the decline from 2024 to 2025?",
+    "Which regions contributed most to revenue growth?",
+    "Which segments offset the revenue decline?",
+    "Within Region A, which products drove the decline?",
+    "Which products drove the previous year's decline?",
+])
+def test_contribution_change_requests_receive_execution_plan(question):
+    assert _build_execution_plan(question) == CONTRIBUTION_CHANGE_EXECUTION_PLAN
+
+
+@pytest.mark.parametrize("question", [
+    "Which product sold the most?",
+    "Show contribution margin by product.",
+    "How much did revenue change from 2024 to 2025?",
+    "Is price correlated with quantity?",
+])
+def test_isolated_ranking_contribution_change_and_correlation_stay_simple(question):
+    assert _build_execution_plan(question) is None
 
 
 def test_v56_trace_records_order_success_and_duplicate_reuse(sample_df: pd.DataFrame):

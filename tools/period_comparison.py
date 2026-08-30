@@ -191,8 +191,11 @@ PERCENTAGE_CHANGE_SCHEMA = {
     "function": {
         "name": "percentage_change",
         "description": (
-            "Compare a numeric column across time periods and compute absolute and percentage "
-            "change. Use this for questions like 'how did sales change from 2024 to 2025?', "
+            "Compare one aggregated or filtered numeric time series across periods and compute "
+            "absolute and percentage change. It does not calculate separate changes or rankings "
+            "for every group; group_column with filter_values only scopes the analyzed series. "
+            "Do not use it to rank which groups drove or experienced the largest KPI movement. "
+            "Use this for questions like 'how did sales change from 2024 to 2025?', "
             "'what is the percentage increase in sales?', 'compare this month with the previous "
             "month', or 'which month had the largest increase?'. For a specific two-year "
             "comparison, set year_1 and year_2. Otherwise, set 'period' to get period-over-period "
@@ -202,7 +205,7 @@ PERCENTAGE_CHANGE_SCHEMA = {
         ),
         "parameters": {
             "type": "object",
-            "properties": {
+            "properties": { "dataset_name": {"type": "string", "description": "The name of the dataset to analyze (e.g. 'sales.csv'). Optional. Defaults to the primary dataset."},
                 "date_column": {"type": "string", "description": "The datetime column to bucket by, e.g. 'Date'."},
                 "value_column": {"type": "string", "description": "The numeric column to compare, e.g. 'Weekly_Sales'."},
                 "period": {"type": ["string", "null"], "enum": sorted(ALLOWED_PERIODS) + [None], "description": "Time bucket size for period-over-period comparison. Defaults to 'month' if null or omitted. Ignored if year_1/year_2 are set."},

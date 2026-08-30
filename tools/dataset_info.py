@@ -2,14 +2,79 @@ from typing import Any
 
 import pandas as pd
 
-from tools.date_utils import detect_date_columns
+from tools.date_utils import (
+    _name_looks_like_date,
+    _parse_date_series,
+    add_period_column,
+    detect_date_columns,
+    format_period_label,
+)
 
 
 MAX_CATEGORY_SAMPLES = 5
+MAX_TEMPORAL_COLUMNS = 3
+PERIOD_PROFILE_LIMITS = {
+    "year": 8,
+    "quarter": 8,
+    "month": 12,
+    "week": 8,
+}
 IDENTIFIER_KEYWORDS = (
     "id", "identifier", "code", "key", "uuid", "guid", "ssn", "account", "pk", "fk",
     "customer_id", "order_id", "product_id", "user_id", "store_id", "employee_id",
 )
+
+
+def _build_period_profile(series: pd.Series) -> dict[str, Any] | None:
+    """Return bounded, canonical period metadata for one datetime-like Series."""
+    if pd.api.types.is_datetime64_any_dtype(series):
+        parsed = series
+    else:
+        parsed, _, _ = _parse_date_series(series)
+        if parsed is None:
+            return None
+
+    populated = parsed.dropna()
+    if populated.empty:
+        return None
+
+    labels: dict[str, list[str]] = {}
+    counts: dict[str, int] = {}
+    for period, limit in PERIOD_PROFILE_LIMITS.items():
+        buckets = add_period_column(populated, period).dropna().drop_duplicates().sort_values()
+        counts[f"{period}s"] = int(len(buckets))
+        labels[period] = [
+            format_period_label(pd.Timestamp(bucket), period)
+            for bucket in buckets.iloc[-limit:]
+        ]
+
+    return {
+        "min_date": pd.Timestamp(populated.min()).strftime("%Y-%m-%d"),
+        "max_date": pd.Timestamp(populated.max()).strftime("%Y-%m-%d"),
+        "years": labels["year"],
+        "recent_quarters": labels["quarter"],
+        "recent_months": labels["month"],
+        "recent_weeks": labels["week"],
+        "period_counts": counts,
+    }
+
+
+def _temporal_profile_columns(
+    df: pd.DataFrame,
+    datetime_columns: list[str],
+    date_column_details: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Choose detailed temporal columns deterministically using existing metadata."""
+    column_order = {str(column): index for index, column in enumerate(df.columns)}
+    return sorted(
+        datetime_columns,
+        key=lambda column: (
+            -int(pd.api.types.is_datetime64_any_dtype(df[column])),
+            -int(_name_looks_like_date(column)),
+            -float(date_column_details.get(column, {}).get("confidence", 0.0)),
+            column_order[column],
+        ),
+    )[:MAX_TEMPORAL_COLUMNS]
 
 
 def build_dataset_profile(df: pd.DataFrame) -> dict[str, Any]:
@@ -41,6 +106,7 @@ def build_dataset_profile(df: pd.DataFrame) -> dict[str, Any]:
             "missing_summary": {},
             "date_columns": [],
             "date_column_details": {},
+            "temporal_profile_omitted_count": 0,
             "column_profiles": {},
             "memory_usage_kb": 0.0,
         }
@@ -150,6 +216,14 @@ def build_dataset_profile(df: pd.DataFrame) -> dict[str, Any]:
             "sample_values": sample_values if sample_values else None,
         }
 
+    profiled_temporal_columns = _temporal_profile_columns(
+        df, datetime_cols, date_column_details
+    )
+    for column in profiled_temporal_columns:
+        period_profile = _build_period_profile(df[column])
+        if period_profile is not None:
+            date_column_details.setdefault(column, {})["period_profile"] = period_profile
+
     return {
         "num_rows": num_rows,
         "num_columns": num_columns,
@@ -167,9 +241,34 @@ def build_dataset_profile(df: pd.DataFrame) -> dict[str, Any]:
         "missing_summary": missing_summary,
         "date_columns": date_columns,
         "date_column_details": date_column_details,
+        "temporal_profile_omitted_count": max(
+            0, len(datetime_cols) - len(profiled_temporal_columns)
+        ),
         "column_profiles": column_profiles,
         "memory_usage_kb": round(df.memory_usage(deep=True).sum() / 1024, 2),
     }
+
+
+def _format_temporal_profile_lines(profile: dict[str, Any]) -> list[str]:
+    lines = []
+    for column in profile.get("datetime_columns", []):
+        period_profile = profile.get("date_column_details", {}).get(column, {}).get("period_profile")
+        if not period_profile:
+            continue
+        counts = period_profile["period_counts"]
+        lines.append(
+            f"- Temporal profile for {column}: range {period_profile['min_date']} -> "
+            f"{period_profile['max_date']}; years {period_profile['years']}; "
+            f"recent quarters {period_profile['recent_quarters']}; "
+            f"recent months {period_profile['recent_months']}; "
+            f"recent weeks {period_profile['recent_weeks']}; period counts "
+            f"years={counts['years']}, quarters={counts['quarters']}, "
+            f"months={counts['months']}, weeks={counts['weeks']}"
+        )
+    omitted = profile.get("temporal_profile_omitted_count", 0)
+    if omitted:
+        lines.append(f"- Temporal detail omitted for {omitted} additional datetime column(s).")
+    return lines
 
 
 def format_dataset_context(df: pd.DataFrame) -> str:
@@ -195,6 +294,7 @@ def format_dataset_context(df: pd.DataFrame) -> str:
             fmt = profile["date_column_details"].get(col, {}).get("format", "datetime")
             date_info.append(f"{col} (format: {fmt})")
         lines.append(f"- Datetime columns: {', '.join(date_info)}")
+        lines.extend(_format_temporal_profile_lines(profile))
 
     if profile["categorical_columns"]:
         cat_info = []
@@ -228,6 +328,89 @@ def format_dataset_context(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+def _format_single_dataset_lines(header: str, df: pd.DataFrame) -> list[str] | None:
+    profile = build_dataset_profile(df)
+    if "error" in profile or profile.get("num_rows", 0) == 0:
+        return None
+
+    lines = [
+        header,
+        f"Shape: {profile['num_rows']} rows, {profile['num_columns']} columns",
+        "- Column dtypes: " + ", ".join(
+            f"{column}: {dtype}" for column, dtype in profile["column_types"].items()
+        ),
+    ]
+
+    if profile["numeric_columns"]:
+        lines.append(f"- Numeric columns: {', '.join(profile['numeric_columns'])}")
+
+    if profile["datetime_columns"]:
+        date_info = []
+        for col in profile["datetime_columns"]:
+            fmt = profile["date_column_details"].get(col, {}).get("format", "datetime")
+            date_info.append(f"{col} (format: {fmt})")
+        lines.append(f"- Datetime columns: {', '.join(date_info)}")
+        lines.extend(_format_temporal_profile_lines(profile))
+
+    if profile["categorical_columns"]:
+        cat_info = []
+        for col in profile["categorical_columns"]:
+            samples = profile["column_profiles"].get(col, {}).get("sample_values", [])
+            sample_str = f", e.g. {samples}" if samples else ""
+            u_count = profile["column_profiles"].get(col, {}).get("unique_count", 0)
+            cat_info.append(f"{col} (unique: {u_count}{sample_str})")
+        lines.append(f"- Categorical columns: {'; '.join(cat_info)}")
+
+    if profile["boolean_columns"]:
+        lines.append(f"- Boolean columns: {', '.join(profile['boolean_columns'])}")
+
+    if profile["candidate_group_columns"]:
+        lines.append(f"- Recommended grouping/filtering columns: {', '.join(profile['candidate_group_columns'])}")
+
+    if profile["potential_identifiers"]:
+        id_names = [f"{item['column']} ({item['status']})" for item in profile["potential_identifiers"]]
+        lines.append(f"- Potential identifier columns: {', '.join(id_names)}")
+
+    if profile["constant_columns"]:
+        lines.append(f"- Constant columns (no variance): {', '.join(profile['constant_columns'])}")
+
+    if profile["all_null_columns"]:
+        lines.append(f"- All-null columns: {', '.join(profile['all_null_columns'])}")
+
+    if profile["missing_summary"]:
+        missing_cols = [f"{col} ({info['missing_percentage']}%)" for col, info in profile["missing_summary"].items()]
+        lines.append(f"- Columns with missing values: {', '.join(missing_cols)}")
+
+    return lines
+
+
+def format_datasets_context(
+    datasets: dict[str, pd.DataFrame] | None = None,
+    derived_datasets: dict[str, pd.DataFrame] | None = None,
+) -> str:
+    """
+    Format contexts for all active and derived datasets, prefixing each with its name.
+    """
+    if not datasets and not derived_datasets:
+        return ""
+
+    contexts = []
+
+    if datasets:
+        for name, df in datasets.items():
+            lines = _format_single_dataset_lines(f"[Dataset: {name}]", df)
+            if lines:
+                contexts.append("\n".join(lines))
+
+    if derived_datasets:
+        for name, df in derived_datasets.items():
+            lines = _format_single_dataset_lines(f"[Derived Dataset: {name}]", df)
+            if lines:
+                contexts.append("\n".join(lines))
+
+    return "\n\n".join(contexts)
+
+
 def dataset_info(df: pd.DataFrame) -> dict[str, Any]:
     """
     Return comprehensive structural, semantic, and quality information about the dataset.
@@ -250,7 +433,12 @@ DATASET_INFO_SCHEMA = {
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "dataset_name": {
+                    "type": "string",
+                    "description": "The name of the dataset to analyze (e.g. 'sales.csv'). Optional. Defaults to the primary dataset.",
+                }
+            },
             "required": [],
         },
     },
