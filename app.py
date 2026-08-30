@@ -3,7 +3,7 @@ import pandas as pd
 
 from agent.agent import Agent, MAX_HISTORY_MESSAGES
 from reports.report_builder import build_analysis_report, render_markdown
-from ui_utils import dataset_signature, load_dataset, user_error_message
+from ui_utils import build_analysis_details, dataset_signature, load_dataset, user_error_message
 
 
 st.set_page_config(page_title="AI Data Analyst", layout="wide")
@@ -121,6 +121,14 @@ if uploaded_files:
 
 df = st.session_state.df
 
+if len(st.session_state.datasets) > 1:
+    preview_dataset_name = st.selectbox(
+        "Dataset to inspect",
+        options=list(st.session_state.datasets.keys()),
+        help="Choose which uploaded dataset is shown in the profile and preview below.",
+    )
+    df = st.session_state.datasets[preview_dataset_name]
+
 if df is not None:
     st.header("Dataset Information")
 
@@ -219,6 +227,24 @@ if df is not None:
         st.plotly_chart(st.session_state.last_figure, use_container_width=True)
 
     if st.session_state.last_analysis_result is not None:
+        details = build_analysis_details(st.session_state.last_analysis_result)
+        with st.expander("Analysis details", expanded=False):
+            st.markdown(f"**Mode:** {details['mode']}")
+            tools_text = ", ".join(details["tools"]) if details["tools"] else "No analytical tools recorded"
+            st.markdown(f"**Tools used:** {tools_text}")
+            st.markdown(f"**Recorded findings/evidence:** {details['finding_count']}")
+            if details["initial_plan_steps"] is not None:
+                st.markdown(f"**Initial autonomous plan:** {details['initial_plan_steps']} step(s)")
+            if details["adaptive_follow_up"]:
+                st.markdown(
+                    f"**Adaptive follow-up:** completed "
+                    f"{details['adaptive_steps_executed']} validated step(s)"
+                )
+            if details["limitations"]:
+                st.markdown("**Safety and limitations**")
+                for limitation in details["limitations"]:
+                    st.caption(f"• {limitation}")
+
         st.subheader("Analysis Report")
         if st.button("Generate Report"):
             report = build_analysis_report(
