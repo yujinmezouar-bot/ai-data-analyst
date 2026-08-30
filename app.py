@@ -9,7 +9,16 @@ from ui_utils import dataset_signature, load_dataset, user_error_message
 st.set_page_config(page_title="AI Data Analyst", layout="wide")
 
 st.title("AI Data Analyst")
-st.write("Upload a dataset and ask questions about it in plain English.")
+st.write(
+    "Ask questions in plain English using LLM-guided planning and deterministic "
+    "analytical tools."
+)
+st.info(
+    "Privacy: analytical calculations primarily run locally. Bounded dataset metadata, "
+    "context, and analytical results may be sent to the configured Groq LLM for "
+    "interpretation, planning, and explanation. Do not upload confidential or sensitive "
+    "data unless you accept this external-provider processing boundary."
+)
 
 
 # ============================================================
