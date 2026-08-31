@@ -3,7 +3,7 @@ from io import BytesIO
 import pandas as pd
 import pytest
 
-from ui_utils import dataset_signature, load_dataset, user_error_message
+from ui_utils import dataset_signature, load_dataset, safe_error_diagnostic, user_error_message
 
 
 class Upload(BytesIO):
@@ -64,3 +64,19 @@ def test_user_error_messages_are_safe_and_actionable():
     assert "too large" in user_error_message(RuntimeError("413 Request too large")).lower()
     assert "temporarily unavailable" in user_error_message(RuntimeError("Groq API timeout")).lower()
     assert "could not be completed" in user_error_message(RuntimeError("internal details"))
+
+
+def test_safe_error_diagnostic_preserves_type_and_cause_but_redacts_secrets():
+    try:
+        try:
+            raise TimeoutError("connection timed out token=private-token")
+        except TimeoutError as cause:
+            raise RuntimeError("Groq API call failed api_key=private-key") from cause
+    except RuntimeError as error:
+        diagnostic = safe_error_diagnostic(error)
+
+    assert "RuntimeError" in diagnostic
+    assert "TimeoutError" in diagnostic
+    assert "private-key" not in diagnostic
+    assert "private-token" not in diagnostic
+    assert "[redacted]" in diagnostic

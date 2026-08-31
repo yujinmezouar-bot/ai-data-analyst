@@ -1,8 +1,118 @@
 import pandas as pd
 import pytest
+import json
+from types import SimpleNamespace
 
 from agent.agent import Agent, _estimate_request_chars, MAX_LLM_REQUEST_CHARS, TOOL_SCHEMAS
 from tools.dataset_info import format_datasets_context
+
+
+class ScriptedReactiveProvider:
+    def __init__(self, dataset_name):
+        arguments = {"column": "Weekly_Sales"}
+        if dataset_name is not None:
+            arguments["dataset_name"] = dataset_name
+        tool_call = SimpleNamespace(function=SimpleNamespace(
+            name="statistics",
+            arguments=json.dumps(arguments),
+        ))
+        self.responses = [
+            SimpleNamespace(content=None, tool_calls=[tool_call]),
+            SimpleNamespace(content="The tool result is sufficient.", tool_calls=None),
+            SimpleNamespace(content="Final grounded answer.", tool_calls=None),
+        ]
+
+    def chat(self, messages, tools=None, tool_choice=None):
+        return self.responses.pop(0)
+
+
+def walmart_datasets():
+    return {
+        "Walmart_Sales.csv": pd.DataFrame({
+            "Store": [1, 2],
+            "Weekly_Sales": [100.0, 300.0],
+        }),
+        "Walmart_Stores_Demo.csv": pd.DataFrame({
+            "Store": [1, 2],
+            "Store_Type": ["A", "B"],
+            "Region": ["North", "South"],
+            "Size_Category": ["Large", "Small"],
+        }),
+    }
+
+
+def test_reactive_explicit_dataset_reference_overrides_incorrect_llm_selection():
+    agent = Agent()
+    agent.llm = ScriptedReactiveProvider("Walmart_Stores_Demo.csv")
+
+    result = agent.run(
+        "Using Walmart_Sales.csv, calculate the total and average Weekly_Sales.",
+        datasets=walmart_datasets(),
+        autonomous=False,
+    )
+
+    assert result["evidence"][0]["tool_name"] == "statistics"
+    assert result["evidence"][0]["result"]["mean"] == 200.0
+    assert "error" not in result["evidence"][0]["result"]
+
+
+def test_reactive_explicit_second_dataset_overrides_incorrect_llm_selection():
+    datasets = walmart_datasets()
+    datasets["Walmart_Stores_Demo.csv"]["Store_Budget"] = [50.0, 150.0]
+    agent = Agent()
+    provider = ScriptedReactiveProvider("Walmart_Sales.csv")
+    provider.responses[0].tool_calls[0].function.arguments = json.dumps({
+        "dataset_name": "Walmart_Sales.csv", "column": "Store_Budget",
+    })
+    agent.llm = provider
+
+    result = agent.run(
+        "Using Walmart_Stores_Demo.csv, calculate the average Store_Budget.",
+        datasets=datasets,
+        autonomous=False,
+    )
+
+    assert result["evidence"][0]["result"]["mean"] == 100.0
+
+
+def test_reactive_omitted_dataset_name_preserves_primary_dataset_default():
+    agent = Agent()
+    agent.llm = ScriptedReactiveProvider(None)
+
+    result = agent.run(
+        "Calculate the average Weekly_Sales.",
+        datasets=walmart_datasets(),
+        autonomous=False,
+    )
+
+    assert result["evidence"][0]["result"]["mean"] == 200.0
+
+
+def test_reactive_unknown_dataset_name_still_fails_safely():
+    agent = Agent()
+    agent.llm = ScriptedReactiveProvider("Unknown.csv")
+
+    result = agent.run(
+        "Using Unknown.csv, calculate the average Weekly_Sales.",
+        datasets=walmart_datasets(),
+        autonomous=False,
+    )
+
+    error = result["evidence"][0]["result"]["error"]
+    assert "Dataset 'Unknown.csv' not found" in error
+
+
+def test_reactive_single_dataset_omission_remains_backward_compatible():
+    agent = Agent()
+    agent.llm = ScriptedReactiveProvider(None)
+
+    result = agent.run(
+        "Calculate the average Weekly_Sales.",
+        datasets={"Walmart_Sales.csv": walmart_datasets()["Walmart_Sales.csv"]},
+        autonomous=False,
+    )
+
+    assert result["evidence"][0]["result"]["mean"] == 200.0
 
 
 @pytest.fixture
@@ -146,4 +256,3 @@ def test_dataset_name_is_stripped_from_tool_args():
     # We should get a valid result back without TypeError
     assert isinstance(result, dict)
     assert "A" in result["columns_with_missing"]
-

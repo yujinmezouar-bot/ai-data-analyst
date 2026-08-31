@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any
 
 import pandas as pd
@@ -177,3 +178,34 @@ def user_error_message(error: Exception, action: str = "analysis") -> str:
     if action == "upload":
         return "The file could not be loaded. Check its format and contents, then try again."
     return "The analysis could not be completed. Please try a more specific question."
+
+
+def safe_error_diagnostic(error: BaseException) -> str:
+    """Return bounded developer diagnostics without request content or credentials."""
+    parts = []
+    current: BaseException | None = error
+    label = "exception"
+    for _ in range(2):
+        if current is None:
+            break
+        message = " ".join(str(current).split())
+        message = re.sub(
+            r"(?i)\b(api[_-]?key|authorization|password|secret|token)\b\s*[:=]\s*[^\s,;]+",
+            r"\1=[redacted]",
+            message,
+        )
+        message = re.sub(r"(?i)\bbearer\s+[^\s,;]+", "Bearer [redacted]", message)
+        message = re.sub(r"\bgsk_[A-Za-z0-9_-]+", "[redacted-key]", message)
+        metadata = []
+        for name in ("status_code", "request_id"):
+            value = getattr(current, name, None)
+            if value is not None:
+                metadata.append(f"{name}={str(value)[:100]}")
+        suffix = f" ({', '.join(metadata)})" if metadata else ""
+        parts.append(
+            f"{label}={type(current).__module__}.{type(current).__name__}: "
+            f"{message[:400]}{suffix}"
+        )
+        current = current.__cause__
+        label = "cause"
+    return "; ".join(parts)[:900]

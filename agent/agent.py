@@ -74,6 +74,12 @@ _REQUIRED_PARAMS = {
     for schema in TOOL_SCHEMAS
 }
 
+_DATASET_SCOPED_TOOLS = {
+    schema["function"]["name"]
+    for schema in TOOL_SCHEMAS
+    if "dataset_name" in schema["function"]["parameters"].get("properties", {})
+}
+
 
 # ============================================================
 # CONVERSATION MEMORY / MULTI-STEP LIMITS
@@ -98,6 +104,35 @@ MAX_LLM_REQUEST_CHARS = 24000
 CONTRIBUTION_CHANGE_EXECUTION_PLAN = (
     "Decompose the observed KPI change into ranked group contributions and offsets."
 )
+
+
+def _resolve_explicit_dataset_reference(
+    question: str, dataset_names: list[str]
+) -> str | None:
+    """Return one canonically named active dataset explicitly mentioned by the user."""
+    matches = [
+        name for name in dataset_names
+        if re.search(
+            rf"(?<!\w){re.escape(str(name))}(?!\w)",
+            question,
+            flags=re.IGNORECASE,
+        )
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _requests_join_with_downstream_analysis(question: str) -> bool:
+    """Recognize an explicit join request that also asks for later analysis."""
+    match = re.search(r"\bjoin\b", question, flags=re.IGNORECASE)
+    if match is None:
+        return False
+    remainder = question[match.end():]
+    return bool(re.search(
+        r"\b(then|calculate|aggregate|group|sum|average|total|identify|analy[sz]e|"
+        r"highest|lowest|trend|correlat|plot|chart)\b",
+        remainder,
+        flags=re.IGNORECASE,
+    ))
 
 
 def _build_execution_plan(question: str) -> str | None:
@@ -859,6 +894,10 @@ class Agent:
 
         # Determine the primary dataset for backward compatibility with tools
         self.primary_df = next(iter(self.active_datasets.values())) if self.active_datasets else None
+        explicit_dataset_name = _resolve_explicit_dataset_reference(
+            question, list(self.active_datasets.keys())
+        )
+        join_pipeline_requested = _requests_join_with_downstream_analysis(question)
 
         execution_plan_signal = _build_execution_plan(question)
         routing_trace = None
@@ -1185,6 +1224,10 @@ class Agent:
         if execution_plan_signal:
             trace.append({"step": "plan", "summary": execution_plan_signal})
         iterations = 0
+        safe_join_inspected = False
+        joined_dataset_name = None
+        joined_dataset_analyzed = False
+        join_continuation_stages: set[str] = set()
 
         # ------------------------------------------------------------
         # MULTI-STEP TOOL-DECISION LOOP (bounded by MAX_TOOL_ITERATIONS)
@@ -1207,6 +1250,31 @@ class Agent:
                         "trace": trace,
                         "evidence": [],
                     }
+                continuation_stage = None
+                if join_pipeline_requested and safe_join_inspected and not joined_dataset_name:
+                    continuation_stage = "execute_join"
+                elif join_pipeline_requested and joined_dataset_name and not joined_dataset_analyzed:
+                    continuation_stage = "analyze_join"
+                if continuation_stage and continuation_stage not in join_continuation_stages:
+                    join_continuation_stages.add(continuation_stage)
+                    working_messages.append({
+                        "role": "assistant",
+                        "content": response_message.content or "(join workflow paused)",
+                    })
+                    if continuation_stage == "execute_join":
+                        reminder = (
+                            "The safe join check is only an intermediate result. The original request also "
+                            "requires executing the safe join and analyzing its derived dataset. Continue "
+                            "with execute_join, then perform the requested downstream analysis."
+                        )
+                    else:
+                        reminder = (
+                            f"The joined dataset is registered as '{joined_dataset_name}', but the original "
+                            "downstream analysis is still incomplete. Call the appropriate analytical tool "
+                            f"with dataset_name='{joined_dataset_name}' now."
+                        )
+                    working_messages.append({"role": "user", "content": reminder})
+                    continue
                 break  # LLM is done requesting tools; go explain results.
 
             round_results = []
@@ -1239,6 +1307,14 @@ class Agent:
                     success = False
                     reused = False
                 else:
+                    selected_dataset_name = tool_args.get("dataset_name")
+                    if (
+                        explicit_dataset_name
+                        and tool_name in _DATASET_SCOPED_TOOLS
+                        and selected_dataset_name not in self.derived_datasets
+                    ):
+                        tool_args = dict(tool_args)
+                        tool_args["dataset_name"] = explicit_dataset_name
                     call_key = (tool_name, json.dumps(tool_args, sort_keys=True))
                     if call_key in executed_calls_cache:
                         cached_result = executed_calls_cache[call_key]
@@ -1264,6 +1340,18 @@ class Agent:
                 if isinstance(tool_result, dict) and "figure" in tool_result:
                     figure = tool_result["figure"]
                     tool_result = {k: v for k, v in tool_result.items() if k != "figure"}
+
+                if success and isinstance(tool_result, dict):
+                    if tool_name == "inspect_join_viability" and tool_result.get("safe_to_join") is True:
+                        safe_join_inspected = True
+                    elif tool_name == "execute_join" and tool_result.get("status") == "success":
+                        joined_dataset_name = tool_result.get("dataset_name")
+                    elif (
+                        joined_dataset_name
+                        and tool_name not in {"inspect_join_viability", "execute_join"}
+                        and selected_dataset_name == joined_dataset_name
+                    ):
+                        joined_dataset_analyzed = True
 
                 evidence_result = tool_result
                 llm_result = (

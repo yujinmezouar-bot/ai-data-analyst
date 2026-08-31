@@ -173,7 +173,10 @@ def _generic_summary(tool: str, result: Any) -> str:
         return f"Statistics for {column}: {', '.join(values)}." if values else f"Statistics for {column}."
     if tool == "groupby_analysis":
         best, worst = result.get("best_group"), result.get("worst_group")
-        parts = [f"best group={best}" if best is not None else "", f"worst group={worst}" if worst is not None else ""]
+        parts = [
+            f"best group={best}" if best is not None else "",
+            f"worst group={worst}" if worst is not None and worst != best else "",
+        ]
         return "Grouped analysis: " + ", ".join(part for part in parts if part) + "."
     if tool == "time_analysis":
         parts = [

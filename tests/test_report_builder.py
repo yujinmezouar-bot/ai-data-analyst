@@ -147,6 +147,28 @@ def test_reactive_evidence_is_reported_and_direct_answer_has_limited_evidence():
     assert any("Structured analytical evidence was unavailable" in item for item in direct.limitations)
 
 
+def test_groupby_report_does_not_label_the_only_returned_top_group_as_worst():
+    result = {
+        "answer": "Type A has the highest total sales.",
+        "figure": None,
+        "evidence": [{"tool_name": "groupby_analysis", "result": {
+            "group_column": "Store_Type",
+            "value_column": "Weekly_Sales",
+            "agg_function": "sum",
+            "result": {"A": 2520470000.0},
+            "best_group": "A",
+            "worst_group": "A",
+            "ranking": ["A"],
+        }}],
+        "trace": [],
+    }
+
+    markdown = render_markdown(build_analysis_report("Highest sales by type?", result, _datasets()))
+
+    assert "Grouped analysis: best group=A." in markdown
+    assert "worst group=A" not in markdown
+
+
 def test_figure_metadata_is_bounded_and_plotly_object_is_not_rendered():
     figure = go.Figure(data=go.Bar(x=["A"], y=[1]))
     figure.update_layout(title="Sales by product")

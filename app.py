@@ -1,9 +1,20 @@
+import logging
+
 import streamlit as st
 import pandas as pd
 
 from agent.agent import Agent, MAX_HISTORY_MESSAGES
 from reports.report_builder import build_analysis_report, render_markdown
-from ui_utils import build_analysis_details, dataset_signature, load_dataset, user_error_message
+from ui_utils import (
+    build_analysis_details,
+    dataset_signature,
+    load_dataset,
+    safe_error_diagnostic,
+    user_error_message,
+)
+
+
+LOGGER = logging.getLogger("ai_data_analyst.app")
 
 
 st.set_page_config(page_title="AI Data Analyst", layout="wide")
@@ -220,6 +231,7 @@ if df is not None:
                 st.session_state.last_analysis_result = None
                 st.session_state.last_question = None
                 st.session_state.last_report_markdown = None
+                LOGGER.error("Analysis failed: %s", safe_error_diagnostic(e))
                 st.error(user_error_message(e))
 
     if st.session_state.last_figure is not None:
