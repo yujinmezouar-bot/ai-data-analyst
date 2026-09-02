@@ -13,6 +13,7 @@ MAX_REPORT_DATASETS = 10
 MAX_REPORT_COLUMNS = 20
 MAX_REPORT_CONTRIBUTORS = 10
 MAX_REPORT_RESULT_ITEMS = 25
+MAX_REPORT_VISUALIZATIONS = 5
 MAX_EXECUTIVE_SUMMARY_CHARS = 6000
 
 
@@ -284,34 +285,46 @@ def _derive_limitations(
             limitations.append(f"Analysis step {entry.get('step', 'unknown')} was {entry.get('status')}.")
     if any(dataset.get("missing") for dataset in dataset_overview):
         limitations.append("Uploaded data contains missing values; affected columns are listed in the dataset overview.")
-    if result.get("figure") is not None:
-        limitations.append("The interactive chart shown in Streamlit is not embedded in the downloaded Markdown report.")
     return _unique(limitations)
 
 
 def _visualization_metadata(result: dict[str, Any], evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    figure = result.get("figure")
-    if figure is None:
-        return []
-    title = None
-    trace_count = None
-    try:
-        title = getattr(getattr(figure.layout, "title", None), "text", None)
-        trace_count = len(figure.data)
-    except Exception:
-        pass
-    metadata = next(
-        (item.get("result") for item in evidence if item.get("tool_name") in {
-            "create_visualization", "create_multi_dataset_visualization"
-        } and isinstance(item.get("result"), dict)),
-        {},
-    )
-    return [{
-        "title": title or metadata.get("description") or "Analysis visualization",
-        "chart_type": metadata.get("chart_type"),
-        "description": metadata.get("description"),
-        "trace_count": trace_count,
-    }]
+    supplied = result.get("visualizations")
+    if not isinstance(supplied, list):
+        supplied = []
+    if not supplied and result.get("figure") is not None:
+        metadata = next(
+            (item.get("result") for item in evidence if item.get("tool_name") in {
+                "create_visualization", "create_multi_dataset_visualization"
+            } and isinstance(item.get("result"), dict)),
+            {},
+        )
+        supplied = [{"figure": result["figure"], **metadata}]
+
+    normalized = []
+    for index, artifact in enumerate(supplied[:MAX_REPORT_VISUALIZATIONS], 1):
+        if not isinstance(artifact, dict):
+            continue
+        figure = artifact.get("figure")
+        title = artifact.get("title")
+        trace_count = None
+        try:
+            title = title or getattr(getattr(figure.layout, "title", None), "text", None)
+            trace_count = len(figure.data)
+        except Exception:
+            pass
+        normalized.append({
+            "number": index,
+            "figure": figure,
+            "title": title or artifact.get("description") or "Analysis visualization",
+            "chart_type": artifact.get("chart_type"),
+            "description": artifact.get("description"),
+            "datasets": [str(name) for name in (artifact.get("datasets") or [])[:10]],
+            "tool_name": artifact.get("tool_name"),
+            "finding_id": artifact.get("finding_id"),
+            "trace_count": trace_count,
+        })
+    return normalized
 
 
 def _provenance_line(item: dict[str, Any]) -> str:
@@ -545,10 +558,20 @@ def render_markdown(report: AnalysisReport) -> str:
     if report.visualizations:
         lines.extend(["## Visualizations", ""])
         for visualization in report.visualizations:
-            details = [visualization.get("chart_type"), visualization.get("description")]
-            details = [str(value) for value in details if value]
-            lines.append(f"- **{visualization['title']}**" + (f" — {'; '.join(details)}" if details else ""))
-        lines.append("")
+            lines.extend([
+                f"### Figure {visualization['number']}: {visualization['title']}",
+                "",
+            ])
+            if visualization.get("description"):
+                lines.append(str(visualization["description"]))
+            if visualization.get("chart_type"):
+                lines.append(f"Chart type: {visualization['chart_type']}.")
+            if visualization.get("datasets"):
+                lines.append("Dataset(s): " + ", ".join(visualization["datasets"]) + ".")
+            if not any(visualization.get(key) for key in ("description", "chart_type", "datasets")):
+                lines.append("Visualization recorded during analysis.")
+            lines.append("The chart image is not embedded in Markdown; it is embedded in the Word report when rendering succeeds.")
+            lines.append("")
 
     if report.limitations:
         lines.extend(["## Limitations", "", *[f"- {item}" for item in report.limitations], ""])

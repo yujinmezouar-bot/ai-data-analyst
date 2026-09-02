@@ -45,3 +45,28 @@ def test_report_state_has_reset_paths_and_markdown_download():
     assert len(reset_assignments) >= 4
     assert any(isinstance(call.func, ast.Attribute) and call.func.attr == "markdown" for call in calls)
     assert any(isinstance(call.func, ast.Attribute) and call.func.attr == "download_button" for call in calls)
+
+
+def test_word_report_uses_completed_report_state_without_rerunning_agent():
+    tree = _tree()
+    calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+    render_calls = [
+        call for call in calls
+        if isinstance(call.func, ast.Name) and call.func.id == "render_docx"
+    ]
+    downloads = [
+        call for call in calls
+        if isinstance(call.func, ast.Attribute) and call.func.attr == "download_button"
+    ]
+
+    assert len(render_calls) == 1
+    assert ast.unparse(render_calls[0].args[0]) == "report"
+    assert any(
+        any(
+            keyword.arg == "mime"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            for keyword in call.keywords
+        )
+        for call in downloads
+    )

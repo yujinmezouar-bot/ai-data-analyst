@@ -4,6 +4,7 @@ import streamlit as st
 import pandas as pd
 
 from agent.agent import Agent, MAX_HISTORY_MESSAGES
+from reports.docx_renderer import render_docx
 from reports.report_builder import build_analysis_report, render_markdown
 from ui_utils import (
     build_analysis_details,
@@ -63,6 +64,9 @@ if "last_question" not in st.session_state:
 if "last_report_markdown" not in st.session_state:
     st.session_state.last_report_markdown = None
 
+if "last_report_docx" not in st.session_state:
+    st.session_state.last_report_docx = None
+
 
 # ============================================================
 # DATASET LOADER
@@ -105,6 +109,7 @@ if uploaded_files:
             st.session_state.last_analysis_result = None
             st.session_state.last_question = None
             st.session_state.last_report_markdown = None
+            st.session_state.last_report_docx = None
 
         names = ", ".join(st.session_state.datasets.keys())
         st.success(f"Loaded successfully: {names}")
@@ -124,6 +129,7 @@ if uploaded_files:
         st.session_state.last_analysis_result = None
         st.session_state.last_question = None
         st.session_state.last_report_markdown = None
+        st.session_state.last_report_docx = None
 
 
 # ============================================================
@@ -176,6 +182,7 @@ if df is not None:
             st.session_state.last_analysis_result = None
             st.session_state.last_question = None
             st.session_state.last_report_markdown = None
+            st.session_state.last_report_docx = None
             st.rerun()
 
     for msg in st.session_state.messages:
@@ -204,6 +211,7 @@ if df is not None:
                 st.session_state.last_analysis_result = None
                 st.session_state.last_question = None
                 st.session_state.last_report_markdown = None
+                st.session_state.last_report_docx = None
                 with st.spinner("Analyzing your dataset, running tools if needed, and generating the final answer..."):
                     agent = get_agent()
                     result = agent.run(
@@ -231,6 +239,7 @@ if df is not None:
                 st.session_state.last_analysis_result = None
                 st.session_state.last_question = None
                 st.session_state.last_report_markdown = None
+                st.session_state.last_report_docx = None
                 LOGGER.error("Analysis failed: %s", safe_error_diagnostic(e))
                 st.error(user_error_message(e))
 
@@ -265,6 +274,7 @@ if df is not None:
                 st.session_state.datasets,
             )
             st.session_state.last_report_markdown = render_markdown(report)
+            st.session_state.last_report_docx = render_docx(report)
 
         if st.session_state.last_report_markdown:
             st.markdown(st.session_state.last_report_markdown)
@@ -274,6 +284,13 @@ if df is not None:
                 file_name="ai_data_analysis_report.md",
                 mime="text/markdown",
             )
+            if st.session_state.last_report_docx:
+                st.download_button(
+                    "Download Word Report",
+                    data=st.session_state.last_report_docx,
+                    file_name="ai_data_analysis_report.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
 
 else:
     st.info("Upload a CSV or Excel file to get started.")

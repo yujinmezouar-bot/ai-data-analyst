@@ -97,6 +97,7 @@ MAX_TOOL_ITERATIONS = 4
 MAX_TOOL_RESULT_CHARS = 4000
 MAX_TRUNCATED_ENTRIES = 25
 MAX_RETURNED_EVIDENCE = 20
+MAX_REPORTABLE_VISUALIZATIONS = 5
 # Conservative character budget (~6k tokens) for a model environment with an
 # 8k TPM limit. Tool schemas are included because providers count them too.
 MAX_LLM_REQUEST_CHARS = 24000
@@ -627,7 +628,10 @@ def _compact_autonomous_findings(findings: list[Any]) -> list[dict[str, Any]]:
     """Convert structured findings into bounded final-explanation evidence."""
     compact: list[dict[str, Any]] = []
     for finding in findings:
-        compact_result = _compact_tool_result(finding.result)
+        raw_result = finding.result
+        if isinstance(raw_result, dict) and "figure" in raw_result:
+            raw_result = {key: value for key, value in raw_result.items() if key != "figure"}
+        compact_result = _compact_tool_result(raw_result)
         serialized_result = json.dumps(compact_result, default=str)
         if len(serialized_result) > MAX_TOOL_RESULT_CHARS:
             compact_result = {
@@ -641,6 +645,34 @@ def _compact_autonomous_findings(findings: list[Any]) -> list[dict[str, Any]]:
             "provenance": _compact_tool_result(finding.provenance),
         })
     return compact
+
+
+def _reportable_visualizations_from_findings(findings: list[Any]) -> list[dict[str, Any]]:
+    """Extract bounded runtime figures without placing them in serialized evidence."""
+    artifacts: list[dict[str, Any]] = []
+    for finding in findings:
+        if len(artifacts) >= MAX_REPORTABLE_VISUALIZATIONS:
+            break
+        result = getattr(finding, "result", None)
+        if not isinstance(result, dict) or not hasattr(result.get("figure"), "to_plotly_json"):
+            continue
+        figure = result["figure"]
+        title = result.get("title")
+        try:
+            title = title or getattr(getattr(figure.layout, "title", None), "text", None)
+        except Exception:
+            pass
+        artifacts.append({
+            "figure": figure,
+            "title": title or result.get("description") or "Analysis visualization",
+            "chart_type": result.get("chart_type"),
+            "description": result.get("description"),
+            "datasets": list(getattr(finding, "datasets", []) or []),
+            "tool_name": str(getattr(finding, "tool_name", "")),
+            "finding_id": str(getattr(finding, "id", "")),
+            "sequence": len(artifacts) + 1,
+        })
+    return artifacts
 
 
 def _autonomous_fallback_answer(compact_findings: list[dict[str, Any]]) -> str:
@@ -1121,6 +1153,7 @@ class Agent:
                             adaptive_limitation = "The proposed adaptive follow-up was not executed because it exceeded safety limits."
 
                 findings = executor.findings_store.all()
+                reportable_visualizations = _reportable_visualizations_from_findings(findings)
                 compact_findings = _compact_autonomous_findings(findings)
                 evidence = [
                     {"tool_name": item["tool_name"], "result": item["result"]}
@@ -1158,6 +1191,7 @@ class Agent:
                 return {
                     "answer": answer,
                     "figure": None,
+                    "visualizations": reportable_visualizations,
                     "trace": [
                         {"step": "question", "question": question},
                         *([routing_trace] if routing_trace else []),
@@ -1213,6 +1247,7 @@ class Agent:
         )
 
         figure = None
+        reportable_visualizations: list[dict[str, Any]] = []
         all_tool_results: list[dict[str, Any]] = []
         all_evidence_results: list[dict[str, Any]] = []
         executed_calls_cache: dict[tuple[str, str], Any] = {}
@@ -1247,6 +1282,7 @@ class Agent:
                     return {
                         "answer": response_message.content,
                         "figure": None,
+                        "visualizations": [],
                         "trace": trace,
                         "evidence": [],
                     }
@@ -1339,6 +1375,38 @@ class Agent:
 
                 if isinstance(tool_result, dict) and "figure" in tool_result:
                     figure = tool_result["figure"]
+                    if (
+                        hasattr(figure, "to_plotly_json")
+                        and len(reportable_visualizations) < MAX_REPORTABLE_VISUALIZATIONS
+                    ):
+                        artifact_title = tool_result.get("title") or tool_result.get("description")
+                        try:
+                            artifact_title = artifact_title or getattr(
+                                getattr(figure.layout, "title", None), "text", None
+                            )
+                        except Exception:
+                            pass
+                        dataset_names = []
+                        if tool_name == "create_multi_dataset_visualization":
+                            dataset_names = list(dict.fromkeys(
+                                str(item.get("dataset_name"))
+                                for item in (tool_args.get("series") or [])
+                                if isinstance(item, dict) and item.get("dataset_name")
+                            ))
+                        else:
+                            selected_name = tool_args.get("dataset_name") or tool_args.get("dataset")
+                            if selected_name:
+                                dataset_names = [str(selected_name)]
+                        reportable_visualizations.append({
+                            "figure": figure,
+                            "title": artifact_title or "Analysis visualization",
+                            "chart_type": tool_result.get("chart_type"),
+                            "description": tool_result.get("description"),
+                            "datasets": dataset_names,
+                            "tool_name": tool_name,
+                            "finding_id": "",
+                            "sequence": len(reportable_visualizations) + 1,
+                        })
                     tool_result = {k: v for k, v in tool_result.items() if k != "figure"}
 
                 if success and isinstance(tool_result, dict):
@@ -1449,6 +1517,7 @@ class Agent:
         return {
             "answer": final_message.content,
             "figure": figure,
+            "visualizations": reportable_visualizations,
             "trace": trace,
             "evidence": list(all_evidence_results[:MAX_RETURNED_EVIDENCE]),
         }
